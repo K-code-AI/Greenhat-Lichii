@@ -2449,7 +2449,7 @@ private:
                         vsync_state->trace_late_callbacks +=
                             VblankInterval.count() > 0 && late >= VblankInterval;
                         vsync_state->trace_max_late =
-                            (std::max)(vsync_state->trace_max_late, late.count());
+                            (std::max<s64>)(vsync_state->trace_max_late, late.count());
                         if (vsync_state->trace_last_callback) {
                             const s64 gap = observed - *vsync_state->trace_last_callback;
                             vsync_state->trace_min_gap = vsync_state->trace_min_gap
@@ -2906,6 +2906,7 @@ private:
                 output = m_outputs.front();
                 m_outputs.pop_front();
             }
+            m_ready->output_ready.store(!m_outputs.empty(), std::memory_order_relaxed);
         }
         if (!output) {
             if (Nx2VideoTraceEnabled()) {
@@ -2938,10 +2939,33 @@ private:
         std::vector<u8> bytes;
         std::unique_lock lk{m_mutex};
         while (true) {
-            m_cv.wait(lk, [&] {
+            const auto ready = [&] {
                 return m_quit || m_flush || (!m_decoded.empty() && !m_free.empty()) ||
                        (!m_inputs.Empty() && m_decoded.size() < MaxDecodedAhead);
-            });
+            };
+            if (decoder && decoder->HasPendingOutput()) {
+                // An asynchronous (hardware) decoder finishes frames on its own: collect them
+                // while idle, or a client waiting for the next frame before it submits more input
+                // never gets it.
+                if (!m_cv.wait_for(lk, std::chrono::milliseconds{4}, ready)) {
+                    if (m_decoded.size() < MaxDecodedAhead) {
+                        lk.unlock();
+                        pictures.clear();
+                        decoder->Poll(pictures);
+                        lk.lock();
+                        m_decoded_frames += pictures.size();
+                        if (!m_flush) {
+                            for (auto& picture : pictures) {
+                                const u64 pts = picture.pts;
+                                m_decoded.push_back({std::move(picture), pts, false});
+                            }
+                        }
+                    }
+                    continue;
+                }
+            } else {
+                m_cv.wait(lk, ready);
+            }
             if (m_quit) {
                 return;
             }
@@ -2979,6 +3003,7 @@ private:
                     m_ready->room.store(false, std::memory_order_relaxed);
                 }
                 system.Host1x().GetSyncpointManager().IncrementGuest(m_syncpoint);
+                m_ready->SignalOutput(system.Kernel());
                 m_last_output = m_outputs.back();
                 if (frame.end && m_inputs.Empty() && m_decoded.empty() &&
                     system.GetApplicationProcessProgramID() == Settings::MarioKartWorldProgramId) {
@@ -3013,7 +3038,8 @@ private:
                                               std::min(input.data.size(), size_t{16})),
                                           " "));
                 }
-                decoder = std::make_unique<Tegra::Host1x::Nx2VideoDecoder>(codec);
+                decoder =
+                    std::make_unique<Tegra::Host1x::Nx2VideoDecoder>(codec, m_width, m_height);
             }
             pictures.clear();
             decoder->Decode(input.data, input.pts, pictures);

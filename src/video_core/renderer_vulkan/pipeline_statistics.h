@@ -16,6 +16,14 @@ namespace Vulkan {
 
 class Device;
 
+/// EDEN_NX2_PIPELINE_STATS=1: log every driver statistic (registers, spills, code size) of each
+/// compute pipeline, by shader hash.
+bool PipelineStatsLogEnabled();
+/// EDEN_NX2_PIPELINE_IR=<hash>: also write that pipeline's internal representations (the
+/// driver's IR and ISA) to the log directory.
+bool PipelineIrRequested(u64 shader_hash);
+void LogPipelineStatistics(const Device& device, VkPipeline pipeline, u64 shader_hash);
+
 class PipelineStatistics {
 public:
     explicit PipelineStatistics(const Device& device_);

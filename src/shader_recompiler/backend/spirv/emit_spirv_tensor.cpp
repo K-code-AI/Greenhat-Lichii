@@ -30,6 +30,17 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
         const auto and_ = [&](Id a, u32 b) { return ctx.OpBitwiseAnd(u32ty, a, imm(b)); };
         const auto unpack = [&](Id v) { return ctx.OpUnpackHalf2x16(ctx.F32[2], v); };
         const auto round_half = [&](Id value) {
+            if (program.info.uses_fp16) {
+                // A round trip through a half: the conversion rounds to nearest even, keeps half
+                // subnormals and overflows to infinity, as the bit operations below do, in two
+                // instructions (RADV fuses it into the last FMA). NoContraction keeps the pair
+                // exact so it is not folded away.
+                const Id half = ctx.OpFConvert(ctx.F16[1], value);
+                ctx.Decorate(half, spv::Decoration::NoContraction);
+                const Id widened = ctx.OpFConvert(f32ty, half);
+                ctx.Decorate(widened, spv::Decoration::NoContraction);
+                return widened;
+            }
             // Do not express the intermediate rounding as unpack(pack(value)): drivers may
             // eliminate that round trip. Round normal significands explicitly, ties to even;
             // half subnormals lie on the exactly representable 2^-24 grid.
@@ -56,11 +67,11 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
         const Id matrix_c = ctx.OpFunctionParameter(ctx.U32[2]);
         ctx.AddLabel();
         const Id counter = ctx.AddLocalVariable(ctx.TypePointer(spv::StorageClass::Function, u32ty),
-                                           spv::StorageClass::Function);
+                                                spv::StorageClass::Function);
         std::array<Id, 4> accumulators;
         for (auto& acc : accumulators)
             acc = ctx.AddLocalVariable(ctx.TypePointer(spv::StorageClass::Function, f32ty),
-                                 spv::StorageClass::Function);
+                                       spv::StorageClass::Function);
         std::array<Id, 8> inputs;
         for (u32 i = 0; i < 4; ++i)
             inputs[i] = ctx.OpCompositeExtract(u32ty, matrix_a, i);
@@ -73,64 +84,73 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
             for (u32 col = 0; col < 2; ++col)
                 ctx.OpStore(accumulators[row * 2 + col], ctx.OpCompositeExtract(f32ty, c, col));
         }
-        ctx.OpStore(counter, imm(0));
         const Id lane = ctx.OpLoad(u32ty, ctx.subgroup_local_invocation_id);
         const Id warp_base = and_(lane, ~31U);
-        const Id row_base = and_(lane, 28);
-        const Id col_base = ctx.OpShiftLeftLogical(u32ty, and_(lane, 3), imm(3));
-        const Id header = ctx.OpLabel(), body = ctx.OpLabel(), next = ctx.OpLabel(), end = ctx.OpLabel();
+        const Id row_base = add(warp_base, and_(lane, 28));
+        const Id col_base = add(warp_base, ctx.OpShiftLeftLogical(u32ty, and_(lane, 3), imm(3)));
+        // A comes from lane `component` of this lane's own quad: a quad broadcast with a constant
+        // index, which hosts do without a general (LDS) shuffle.
+        const bool quad = ctx.profile.support_quad_shuffles;
+        if (quad) {
+            ctx.AddCapability(spv::Capability::GroupNonUniformQuad);
+        }
+        // One iteration per K=8 group (the four K pairs between roundings), unrolled so every
+        // pair's lanes are constants. Unrolling all of K=16 instead lets the host compiler hoist
+        // the second group's shuffles, and large networks then spill registers.
+        const u32 groups = variant ? 2 : 1;
+        const Id header = ctx.OpLabel(), body = ctx.OpLabel(), next = ctx.OpLabel(),
+                 end = ctx.OpLabel();
+        ctx.OpStore(counter, imm(0));
         ctx.OpBranch(header);
         ctx.AddLabel(header);
-        const Id pair = ctx.OpLoad(u32ty, counter);
-        const Id more = ctx.OpULessThan(ctx.U1, pair, imm(variant ? 8 : 4));
+        const Id group = ctx.OpLoad(u32ty, counter);
+        const Id more = ctx.OpULessThan(ctx.U1, group, imm(groups));
         ctx.OpLoopMerge(end, next, spv::LoopControlMask::DontUnroll);
         ctx.OpBranchConditional(more, body, end);
         ctx.AddLabel(body);
-        const Id upper = ctx.OpUGreaterThanEqual(ctx.U1, pair, imm(4));
-        const Id component = and_(pair, 3);
-        const Id a_lane = add(warp_base, add(row_base, component));
-        const Id b_lane = add(warp_base, add(col_base, component));
-        const Id b = ctx.OpSelect(u32ty, upper, inputs[5], inputs[4]);
-        std::array<Id, 2> bs;
-        for (u32 col = 0; col < 2; ++col)
-            bs[col] = unpack(ctx.OpGroupNonUniformShuffle(u32ty, imm(3), b,
-                                                          add(b_lane, imm(col * 4))));
-        const Id round_now = ctx.OpIEqual(ctx.U1, component, imm(3));
-        for (u32 row = 0; row < 2; ++row) {
-            const Id a = ctx.OpSelect(u32ty, upper, inputs[row + 2], inputs[row]);
-            const Id as = unpack(ctx.OpGroupNonUniformShuffle(u32ty, imm(3), a, a_lane));
-            for (u32 col = 0; col < 2; ++col) {
-                Id value = ctx.OpLoad(f32ty, accumulators[row * 2 + col]);
-                for (u32 half = 0; half < 2; ++half) {
-                    value = ctx.OpFma(f32ty, ctx.OpCompositeExtract(f32ty, as, half),
-                                      ctx.OpCompositeExtract(f32ty, bs[col], half), value);
-                    ctx.Decorate(value, spv::Decoration::NoContraction);
+        const Id upper = ctx.OpUGreaterThanEqual(ctx.U1, group, imm(1));
+        const auto pick = [&](u32 low, u32 high) {
+            return groups == 1 ? inputs[low] : ctx.OpSelect(u32ty, upper, inputs[high], inputs[low]);
+        };
+        const Id b = pick(4, 5);
+        std::array<Id, 2> a_regs{pick(0, 2), pick(1, 3)};
+        for (u32 component = 0; component < 4; ++component) {
+            std::array<Id, 2> bs;
+            for (u32 col = 0; col < 2; ++col)
+                bs[col] = unpack(ctx.OpGroupNonUniformShuffle(
+                    u32ty, imm(3), b, add(col_base, imm(component + col * 4))));
+            for (u32 row = 0; row < 2; ++row) {
+                const Id shuffled =
+                    quad ? ctx.OpGroupNonUniformQuadBroadcast(u32ty, imm(3), a_regs[row],
+                                                              imm(component))
+                         : ctx.OpGroupNonUniformShuffle(u32ty, imm(3), a_regs[row],
+                                                        add(row_base, imm(component)));
+                const Id as = unpack(shuffled);
+                for (u32 col = 0; col < 2; ++col) {
+                    Id value = ctx.OpLoad(f32ty, accumulators[row * 2 + col]);
+                    for (u32 half = 0; half < 2; ++half) {
+                        value = ctx.OpFma(f32ty, ctx.OpCompositeExtract(f32ty, as, half),
+                                          ctx.OpCompositeExtract(f32ty, bs[col], half), value);
+                        ctx.Decorate(value, spv::Decoration::NoContraction);
+                    }
+                    ctx.OpStore(accumulators[row * 2 + col], value);
                 }
-                ctx.OpStore(accumulators[row * 2 + col], value);
             }
         }
         // HMMA.F16 rounds after each K=8 group, including the midpoint of K=16.
-        // OpSelect evaluates both operands: keep the expensive half conversion in
-        // a branch so the other three pairs do no rounding work. The counter is
-        // identical in every participating lane and all shuffles precede this branch.
-        const Id round_block = ctx.OpLabel(), round_merge = ctx.OpLabel();
-        ctx.OpSelectionMerge(round_merge, spv::SelectionControlMask::DontFlatten);
-        ctx.OpBranchConditional(round_now, round_block, round_merge);
-        ctx.AddLabel(round_block);
         for (const Id accumulator : accumulators) {
             ctx.OpStore(accumulator, round_half(ctx.OpLoad(f32ty, accumulator)));
         }
-        ctx.OpBranch(round_merge);
-        ctx.AddLabel(round_merge);
         ctx.OpBranch(next);
         ctx.AddLabel(next);
-        ctx.OpStore(counter, add(pair, imm(1)));
+        ctx.OpStore(counter, add(group, imm(1)));
         ctx.OpBranch(header);
         ctx.AddLabel(end);
         std::array<Id, 2> packed;
         for (u32 row = 0; row < 2; ++row)
             packed[row] = ctx.OpPackHalf2x16(u32ty, ctx.OpCompositeConstruct(ctx.F32[2],
-                ctx.OpLoad(f32ty, accumulators[row * 2]), ctx.OpLoad(f32ty, accumulators[row * 2 + 1])));
+                ctx.OpLoad(f32ty, accumulators[row * 2]),
+                ctx.OpLoad(f32ty, accumulators[row * 2 + 1])));
         ctx.OpReturnValue(ctx.OpCompositeConstruct(ctx.U32[2], packed[0], packed[1]));
         ctx.OpFunctionEnd();
     }

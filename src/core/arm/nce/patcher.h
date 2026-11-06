@@ -152,6 +152,8 @@ private:
         std::vector<Relocation> m_write_module_pc_relocations{};
         std::vector<Relocation> m_write_module_pc_relocations_pre{};
         std::vector<ModuleTextAddress> m_exclusives{};
+        // In-place rewrites of pointer-authentication instructions (index, replacement word).
+        std::vector<std::pair<ModuleTextAddress, u32>> m_pac_rewrites{};
     };
 
     oaknut::VectorCodeGenerator c;

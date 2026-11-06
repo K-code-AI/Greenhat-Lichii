@@ -345,6 +345,8 @@ struct DeviceDispatch : InstanceDispatch {
 #endif
     PFN_vkGetPipelineExecutablePropertiesKHR vkGetPipelineExecutablePropertiesKHR{};
     PFN_vkGetPipelineExecutableStatisticsKHR vkGetPipelineExecutableStatisticsKHR{};
+    PFN_vkGetPipelineExecutableInternalRepresentationsKHR
+        vkGetPipelineExecutableInternalRepresentationsKHR{};
     PFN_vkGetQueryPoolResults vkGetQueryPoolResults{};
     PFN_vkGetSemaphoreCounterValue vkGetSemaphoreCounterValue{};
     PFN_vkMapMemory vkMapMemory{};
@@ -1131,6 +1133,11 @@ public:
 
     std::vector<VkPipelineExecutableStatisticKHR> GetPipelineExecutableStatisticsKHR(
         VkPipeline pipeline, u32 executable_index) const;
+
+    /// Name and text of each internal representation (e.g. the driver's IR and ISA).
+    std::vector<std::pair<std::string, std::string>>
+    GetPipelineExecutableInternalRepresentationsKHR(VkPipeline pipeline,
+                                                     u32 executable_index) const;
 
     void UpdateDescriptorSets(Span<VkWriteDescriptorSet> writes,
                               Span<VkCopyDescriptorSet> copies) const noexcept;

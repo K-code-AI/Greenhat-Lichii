@@ -253,6 +253,9 @@ public:
 
     bool IsNativeMode() const { return native_mode; }
     bool ProcessGameDlss(u64 program_id, u64 native_key);
+    /// Ocarina of Time's movie network (ocarina_movie.h): true when this dispatch is skipped or
+    /// replaced.
+    bool ProcessOcarinaMovie(u64 program_id, u64 native_key);
     void TraceDlssContract(u64 native_key, bool warn_unvalidated = true);
     bool IsDlssDispatch() const { return native_mode && dlss_chain.active; }
 
@@ -323,6 +326,9 @@ private:
     u32 dlss_contract_trace_count{};
     GPUVAddr dlss_motion_color{};
     VideoCommon::FireEmblemUpscale::FrameJitter fe_upscale_jitter;
+    /// Ocarina of Time's RGB movie frame (ocarina_movie.h), from this frame's conversion pass.
+    std::optional<Texture::TICEntry> ocarina_movie_frame;
+    std::optional<Texture::TICEntry> ComputeImageHandle(u32 offset) const;
     bool ProcessNativeMethod(Core::System& system, u32 method, u32 argument, bool is_last_call);
     NativeQmdScheduler native_qmd;
     std::array<u32, 0xc00>* native_data_ram{};

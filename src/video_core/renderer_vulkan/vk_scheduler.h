@@ -10,7 +10,10 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <functional>
+#include <mutex>
+#include <string>
 #include <memory>
 #include <thread>
 #include <utility>
@@ -462,6 +465,16 @@ private:
     };
     SubmissionTrace trace_work;
     std::vector<SubmissionTrace> trace_submissions;
+    /// EDEN_NX2_HANG_WATCH: pipelines recorded into the last submissions, for a stalled wait.
+    struct HangSubmission {
+        u64 tick{};
+        std::vector<std::string> pipelines;
+    };
+    void HangRecord(std::string pipeline);
+    void ReportStall(u64 tick, u64 gpu_tick, u64 next_tick, u64 waited_s);
+    std::vector<std::string> hang_work; ///< Worker thread: the submission being recorded
+    std::mutex hang_mutex;
+    std::deque<HangSubmission> hang_submissions;
     static constexpr u32 TraceMaxWork = 4096;
     struct WorkTrace {
         u64 hash{};
