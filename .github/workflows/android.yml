@@ -1,3 +1,4 @@
+
 # Builds the Lichii Android app (arm64 APK) on every push and on demand.
 name: android
 
