@@ -10,80 +10,84 @@
   <img src="dist/branding/lichii_icon_with_logo.png" alt="Lichii" width="600">
 </p>
 
-# Lichii
+# Lichii for Android
 
-Lichii is an experimental, open-source Nintendo Switch and Switch 2 emulator written in C++. It builds on Eglantine, Eden, yuzu and Sudachi, preserving their contributions while developing this fork's game compatibility and renderer fixes.
+An Android port of the [Lichii](https://github.com/zortos293/Eglantine) Nintendo Switch / Switch 2 emulator, maintained by [pavelgajdo](https://github.com/pavelgajdo). It focuses on getting Switch 2 games running on Android phones, starting with Samsung's Exynos phones and their AMD-based Xclipse GPUs.
 
-This is an independent fork, not an official release of those upstream projects. Lichii is not affiliated with Nintendo.
+This is an independent, experimental fork. It is not affiliated with Nintendo or with the upstream projects it builds on.
 
-## Downloads and setup
+## Download
 
-Published builds belong on this fork's [releases page](https://github.com/zortos293/Eglantine/releases). The repository still uses its historical Eglantine name; the desktop application is now Lichii.
+- **Releases:** [github.com/pavelgajdo/Lichii-Android/releases](https://github.com/pavelgajdo/Lichii-Android/releases). Download the `.apk` from the latest `android-*` release and install it on your phone. You may need to allow installs from your browser or file manager.
+- **Test builds:** the `android-latest` pre-release is rebuilt automatically from every change on `nx2`. It has the newest fixes and the newest bugs.
 
-On Windows, extract the entire build archive and run **lichii.exe**. Only use games and system files you have legally obtained. Games, keys and firmware are not included.
+Requirements: an arm64 phone with Android 13 or newer and Vulkan 1.3. Games, keys and firmware are not included. Only use games and system files you have legally obtained.
 
-### Existing saves and settings
+## Tested on
 
-The rebrand intentionally retains the existing Eden/Eglantine data directories and configuration keys. It does not move or delete saves, settings or shader caches. Back up your saves before testing experimental builds.
+| | |
+|---|---|
+| Phone | Samsung Galaxy S26 (SM-S942B) |
+| SoC | Exynos 2600 |
+| GPU | Samsung Xclipse 960 (AMD RDNA3, GFX11) |
+| RAM | 12 GB |
+| OS | Android 17 (One UI) |
+| GPU driver | Custom Mesa RADV build for Xclipse ("RADV Xclipse", Mesa 27.0-devel), installed through the app's GPU driver manager |
 
-## Compatibility and issue reports
+Samsung's own driver on the S26 is also RADV-based and works, but on this phone it measured about 1.8× slower on the same scene than the custom RADV build.
 
-Compatibility and performance vary by game, hardware and driver. Rendering errors, stutters and crashes remain possible. Passing automated tests does not establish that a game renders correctly, and this project makes no universal frame-rate guarantee.
+Other phones may work, but this is the only device the fork is tested on so far.
 
-When [reporting an issue](https://github.com/zortos293/Eglantine/issues), include:
+> 📺 **Game Testing & Video Footage:** Check out gameplay performance tests and video showcases on the [Exynos Gaming YouTube Channel](https://www.youtube.com/@ExynosGaming-t7k).
 
-- The exact build, game version, CPU, GPU and driver version.
-- Relevant settings and steps to reproduce the problem.
-- A screenshot and the log from the affected session, after checking it for personal information.
+## Game status
 
-Do not upload game files, keys, firmware or private account information.
+| Game | Status |
+|---|---|
+| The Legend of Zelda: Ocarina of Time (Switch 2) | Boots. The title screen and the pre-rendered intro movies run at 60 FPS. **It currently hangs while loading the first gameplay scene after the intro** (being worked on). |
 
-## Building and contributing
+Only results tested on the phone above are listed here.
 
-See the [build guide](docs/Build.md), [user documentation](docs/user/README.md) and [coding guidelines](docs/Coding.md). Some inherited documentation and internal build target names still use upstream names. The GUI build target remains `yuzu`; its output is `lichii.exe` on Windows and `lichii` on other desktop platforms.
+### What's different from upstream
 
-Keep changes focused and distinguish code-level checks from actual gameplay testing.
+- AV1 movies are decoded with Android's hardware decoder (MediaCodec).
+- Ocarina of Time's movies skip the game's movie-enhancement neural network (which needs NVIDIA tensor cores), so they play at full speed instead of about 8 FPS.
+- Emulated tensor-core math (HMMA) is about twice as fast on RADV.
+- `EDEN_*` diagnostic switches can be set on Android with an `env.txt` file (see below).
 
-## Artwork
-Art created by YOB (yobslab)
-The supplied Lichii logo, icon and library artwork are in [dist/branding](dist/branding). Windows, Linux and macOS icon resources are generated from that artwork by [Generate-LichiiIcons.ps1](tools/Generate-LichiiIcons.ps1).
+## Recommended settings
 
-## Support Lichii
+- **System:** Handheld mode.
+- **CPU:** NCE backend.
+- **Graphics:** 1× resolution. Install a custom RADV driver if your phone has an Xclipse GPU.
 
-Lichii is free and stays free. If you want to help, you can donate in crypto. Donations help pay for the AI tools and build machines used to develop this open-source project faster.
+## Reporting problems
 
-**Solana (SOL)**
-```text
-JepEjfyWjGjhJvHSrqj52KtLjcbbbmUh1iGqerYBF4w
+[Open an issue](https://github.com/pavelgajdo/Lichii-Android/issues) with:
+
+- your phone model, Android version and GPU driver;
+- the game and what happened (screenshots help);
+- the log from the affected session: `Android/data/dev.lichii.android/files/log/eden_log.txt` (`dev.lichii.android.relWithDebInfo` for test builds).
+
+Check logs for personal information before uploading. Never upload games, keys, firmware or account data.
+
+### Diagnostic switches
+
+Android can't pass environment variables to an app, so Lichii reads them from `Android/data/<app id>/files/env.txt`, one `KEY=VALUE` per line (`#` starts a comment). They take effect the next time the app starts. The available switches are listed in [AGENTS.md](AGENTS.md#debugging-tools). Leave the file empty for normal play: most switches slow the emulator down.
+
+## Building
+
+```bash
+cd src/android
+./gradlew assembleMainlineRelWithDebInfo
 ```
 
-**Ethereum (ETH)**
-```text
-0x055ABa1b80Bc35C836Ce7E9F47c2b3d6C75b5534
-```
+You need the Android SDK, NDK 28.2 and CMake 3.22. The APK is written to `src/android/app/build/outputs/apk/mainline/relWithDebInfo/`. CI builds every push (see [.github/workflows/android.yml](.github/workflows/android.yml)). Pushing a tag named `android-<version>` publishes a release with the APK.
 
-**Bitcoin (BTC)**
-```text
-bc1qcvxdpf4qvdhqp8ee4s355cjmxrzsphsdwpl8w4
-```
-
-**BNB Smart Chain (BNB)**
-```text
-0x055ABa1b80Bc35C836Ce7E9F47c2b3d6C75b5534
-```
-
-**Polygon**
-```text
-0x055ABa1b80Bc35C836Ce7E9F47c2b3d6C75b5534
-```
-
-Send each coin on its matching network. Coins sent on the wrong network can't be recovered.
-
-> [!NOTE]
-> Donations are voluntary gifts and are non-refundable. A donation does not buy any product, service, perk, early access, exclusive build, priority support or say in the project. Every release stays free and public for everyone.
+More documentation, inherited from upstream: [build guide](docs/Build.md), [coding guidelines](docs/Coding.md).
 
 ## Credits and license
 
-Lichii inherits the work of the Eglantine, Eden, yuzu and Sudachi projects and their contributors, including Eglantine's original developer Camille LaVey. Original copyright notices and third-party licenses are retained.
+Lichii for Android builds on [Lichii](https://github.com/zortos293/Eglantine) by Zortos and on Eglantine, Eden, yuzu and Sudachi, and their contributors, including Eglantine's original developer Camille LaVey. Lichii artwork by YOB (yobslab). Original copyright notices and third-party licenses are retained.
 
-See [LICENSE.txt](LICENSE.txt) and the source files for applicable license terms.
+See [LICENSE.txt](LICENSE.txt) and the source files for the applicable license terms.

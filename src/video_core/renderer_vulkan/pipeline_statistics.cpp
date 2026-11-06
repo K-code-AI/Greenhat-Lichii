@@ -4,11 +4,15 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <fstream>
+#include <string>
 #include <string_view>
 
 #include <fmt/ranges.h>
 
 #include "common/common_types.h"
+#include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -28,6 +32,47 @@ static u64 GetUint64(const VkPipelineExecutableStatisticKHR& statistic) {
         return static_cast<u64>(statistic.value.f64);
     default:
         return 0;
+    }
+}
+
+bool PipelineStatsLogEnabled() {
+    static const bool enabled = std::getenv("EDEN_NX2_PIPELINE_STATS") != nullptr;
+    return enabled;
+}
+
+bool PipelineIrRequested(u64 shader_hash) {
+    static const char* const value = std::getenv("EDEN_NX2_PIPELINE_IR");
+    return value && std::strtoull(value, nullptr, 16) == shader_hash;
+}
+
+void LogPipelineStatistics(const Device& device, VkPipeline pipeline, u64 shader_hash) {
+    const std::vector properties{device.GetLogical().GetPipelineExecutablePropertiesKHR(pipeline)};
+    for (u32 executable = 0; executable < static_cast<u32>(properties.size()); ++executable) {
+        std::string line;
+        for (const auto& statistic :
+             device.GetLogical().GetPipelineExecutableStatisticsKHR(pipeline, executable)) {
+            line += fmt::format(" | {}={}", statistic.name, GetUint64(statistic));
+        }
+        LOG_INFO(Render_Vulkan, "Pipeline stats {:016x} {}:{}", shader_hash,
+                 properties[executable].name, line);
+        if (!PipelineIrRequested(shader_hash)) {
+            continue;
+        }
+        for (const auto& [name, text] :
+             device.GetLogical().GetPipelineExecutableInternalRepresentationsKHR(pipeline,
+                                                                                 executable)) {
+            std::string file_name = fmt::format("pipeline-{:016x}-{}-{}.txt", shader_hash,
+                                                executable, name);
+            for (char& c : file_name) {
+                if (c == ' ' || c == '/') {
+                    c = '_';
+                }
+            }
+            const auto path = Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) / file_name;
+            std::ofstream{path} << text;
+            LOG_INFO(Render_Vulkan, "Pipeline IR {:016x} {} written to {}", shader_hash, name,
+                     path.string());
+        }
     }
 }
 

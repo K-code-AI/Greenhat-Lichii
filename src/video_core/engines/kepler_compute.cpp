@@ -23,6 +23,7 @@
 #include "core/core.h"
 #include "video_core/gpu_split.h"
 #include "video_core/fire_emblem_upscale.h"
+#include "video_core/ocarina_movie.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2.h"
 #include "video_core/engines/fermi_2d.h"
@@ -1075,6 +1076,126 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
                  output->Width(), output->Height(), jitter->offset[0], jitter->offset[1]);
     }
     return done;
+}
+
+// The TIC entry an image handle in constant bank 0 points to.
+std::optional<Texture::TICEntry> KeplerCompute::ComputeImageHandle(u32 offset) const {
+    const auto& cbuf = launch_description.const_buffer_config[0];
+    const GPUVAddr address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
+    if (!(launch_description.const_buffer_enable_mask & 1) || cbuf.size.Value() < offset + 4 ||
+        !memory_manager.IsFullyMappedRange(address + offset, sizeof(u32))) {
+        return std::nullopt;
+    }
+    const u32 index = memory_manager.Read<u32>(address + offset) & 0xfffff;
+    if (index > regs.tic.limit ||
+        !memory_manager.IsFullyMappedRange(regs.tic.Address() + u64{index} * sizeof(Texture::TICEntry),
+                                           sizeof(Texture::TICEntry))) {
+        return std::nullopt;
+    }
+    return GetTICEntry(index);
+}
+
+// Ocarina of Time's movie frames (ocarina_movie.h): the conversion pass runs and its RGB frame is
+// kept, the network passes are skipped, and the output pass becomes a bilinear blit of the frame
+// into the output image. Without a frame from this evaluation everything runs natively; if the
+// blit is ever refused, the network runs natively for the rest of the session.
+bool KeplerCompute::ProcessOcarinaMovie(u64 program_id, u64 native_key) {
+    using namespace VideoCommon::OcarinaMovie;
+    static bool failed = false;
+    if (program_id != ProgramId || failed) {
+        return false;
+    }
+    // Single 2D RGBA8 images. The output's TIC carries a base layer of 32, which a 2D (not array)
+    // image does not use.
+    const auto rgba8 = [](const Texture::TICEntry& tic) {
+        using namespace Tegra::Texture;
+        return (tic.texture_type == TextureType::Texture2D ||
+                tic.texture_type == TextureType::Texture2DNoMipmap) &&
+               tic.IsBlockLinear() && tic.Depth() == 1 && tic.max_mip_level == 0 &&
+               tic.Address() != 0 && tic.format == TextureFormat::A8B8G8R8 &&
+               tic.srgb_conversion == 0 &&
+               tic.r_type == ComponentType::UNORM && tic.g_type == ComponentType::UNORM &&
+               tic.b_type == ComponentType::UNORM && tic.a_type == ComponentType::UNORM;
+    };
+    if (native_key == ConvertKey) {
+        ocarina_movie_frame = ComputeImageHandle(ConvertImageOffset);
+        if (ocarina_movie_frame && !rgba8(*ocarina_movie_frame)) {
+            ocarina_movie_frame.reset();
+        }
+        return false;
+    }
+    if (!ocarina_movie_frame) {
+        return false;
+    }
+    if (IsNetwork(native_key)) {
+        return true;
+    }
+    if (native_key != OutputKey) {
+        return false;
+    }
+    const Texture::TICEntry frame = *std::exchange(ocarina_movie_frame, std::nullopt);
+    const auto output = ComputeImageHandle(OutputImageOffset);
+    const auto surface = [](const Texture::TICEntry& tic) {
+        Fermi2D::Surface result{};
+        result.format = Tegra::RenderTargetFormat::A8B8G8R8_UNORM;
+        result.linear = Fermi2D::MemoryLayout::BlockLinear;
+        result.block_width.Assign(tic.block_width);
+        result.block_height.Assign(tic.block_height);
+        result.block_depth.Assign(tic.block_depth);
+        result.depth = 1;
+        result.width = tic.Width();
+        result.height = tic.Height();
+        result.addr_upper = static_cast<u32>(tic.Address() >> 32);
+        result.addr_lower = static_cast<u32>(tic.Address());
+        return result;
+    };
+    bool done = false;
+    if (output && rgba8(*output) && output->Address() != frame.Address()) {
+        const Fermi2D::Config config{
+            .operation = Fermi2D::Operation::SrcCopy,
+            .filter = Fermi2D::Filter::Bilinear,
+            .must_accelerate = true,
+            .dst_x0 = 0,
+            .dst_y0 = 0,
+            .dst_x1 = static_cast<s32>(output->Width()),
+            .dst_y1 = static_cast<s32>(output->Height()),
+            .src_x0 = 0,
+            .src_y0 = 0,
+            .src_x1 = static_cast<s32>(frame.Width()),
+            .src_y1 = static_cast<s32>(frame.Height()),
+        };
+        done = rasterizer->AccelerateSurfaceCopy(surface(frame), surface(*output), config);
+    }
+    if (!done) {
+        failed = true;
+        const auto describe = [](const Texture::TICEntry& tic) {
+            return fmt::format("{:#x} {}x{} depth {} layer {} type {} format {} types {}/{}/{}/{} "
+                               "srgb {} block linear {} mips {}",
+                               tic.Address(), tic.Width(), tic.Height(), tic.Depth(),
+                               tic.BaseLayer(),
+                               static_cast<u32>(tic.texture_type.Value()),
+                               static_cast<u32>(tic.format.Value()),
+                               static_cast<u32>(tic.r_type.Value()),
+                               static_cast<u32>(tic.g_type.Value()),
+                               static_cast<u32>(tic.b_type.Value()),
+                               static_cast<u32>(tic.a_type.Value()), tic.srgb_conversion.Value(),
+                               tic.IsBlockLinear(), tic.max_mip_level.Value());
+        };
+        LOG_WARNING(HW_GPU,
+                    "Ocarina of Time movie: the frame blit is unavailable (frame {}; output {}; "
+                    "usable output {}); the movie network runs natively",
+                    describe(frame), output ? describe(*output) : std::string{"unreadable"},
+                    output && rgba8(*output));
+        return false;
+    }
+    static bool logged = false;
+    if (!std::exchange(logged, true)) {
+        LOG_INFO(HW_GPU, "Ocarina of Time movie: frame {:#x} {}x{} scaled into {:#x} {}x{} in place "
+                         "of the movie network",
+                 frame.Address(), frame.Width(), frame.Height(), output->Address(),
+                 output->Width(), output->Height());
+    }
+    return true;
 }
 
 void KeplerCompute::ProcessLaunch() {

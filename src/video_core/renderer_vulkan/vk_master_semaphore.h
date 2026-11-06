@@ -9,6 +9,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <queue>
@@ -53,6 +54,11 @@ public:
 
     /// Waits for a tick to be hit on the GPU
     void Wait(u64 tick);
+
+    /// EDEN_NX2_HANG_WATCH=1: a wait for a GPU tick that lasts more than a few seconds calls this
+    /// (waited tick, tick the GPU reached, next tick to be submitted, seconds waited).
+    static bool HangWatchEnabled();
+    std::function<void(u64, u64, u64, u64)> on_stall;
 
     /// Submits the device graphics queue, updating the tick as necessary
     VkResult SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,

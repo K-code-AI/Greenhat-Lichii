@@ -350,7 +350,8 @@ vk::ShaderModule EmitShaderModule(const Device& device, const Shader::Profile& p
     // Text log + .spv dump. Text log is gated by gpu_log_level != Off; .spv dump
     // is independent and gated only by gpu_log_shader_dumps.
     const bool should_log = GPU::Logging::IsActive();
-    const bool should_dump = Settings::values.gpu_log_shader_dumps.GetValue();
+    const bool should_dump = Settings::values.gpu_log_shader_dumps.GetValue() ||
+                             std::getenv("EDEN_NX2_SPIRV_DUMP") != nullptr;
     if (should_log || should_dump) {
         static constexpr std::array stage_names{"vertex", "tess_control", "tess_eval", "geometry",
                                                "fragment"};
@@ -1596,7 +1597,8 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
 
     // Text log + .spv dump. Same split as the graphics path.
     const bool should_log = GPU::Logging::IsActive();
-    const bool should_dump = Settings::values.gpu_log_shader_dumps.GetValue();
+    const bool should_dump = Settings::values.gpu_log_shader_dumps.GetValue() ||
+                             std::getenv("EDEN_NX2_SPIRV_DUMP") != nullptr;
     if (should_log || should_dump) {
         const std::string shader_name = fmt::format("shader_{:016x}_compute", key.unique_hash);
         if (should_log) {

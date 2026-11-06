@@ -64,7 +64,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "dev.eden.eden_emulator"
+        applicationId = "dev.lichii.android"
         minSdk = 24
         targetSdk = 36
         versionName = getGitVersion()
@@ -190,8 +190,8 @@ android {
             isDefault = true
             minSdk = 33
 
-            manifestPlaceholders += mapOf("appNameBase" to "Eden")
-            resValue("string", "app_name_suffixed", "Eden")
+            manifestPlaceholders += mapOf("appNameBase" to "Lichii")
+            resValue("string", "app_name_suffixed", "Lichii")
 
             ndk {
                 abiFilters += listOf("arm64-v8a")

@@ -108,7 +108,9 @@ if (HAIKUOS)
     set(GLSLANGVALIDATOR "glslang")
 else()
     # Normal sane platform who doesn't have a CRASHING glslangValidator
-    find_program(GLSLANGVALIDATOR "glslangValidator")
+    # Also look in the Vulkan SDK, so a fresh SDK install works without restarting the IDE.
+    file(GLOB _VULKAN_SDK_BINS "$ENV{VULKAN_SDK}/Bin" "C:/VulkanSDK/*/Bin")
+    find_program(GLSLANGVALIDATOR "glslangValidator" HINTS ${_VULKAN_SDK_BINS})
 endif()
 
 if ("${GLSLANGVALIDATOR}" STREQUAL "GLSLANGVALIDATOR-NOTFOUND")

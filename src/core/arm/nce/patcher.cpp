@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <numeric>
+#include <algorithm>
+#include <optional>
 #include <bit>
 #include "common/cpu_features.h"
 #include "common/alignment.h"
@@ -25,6 +27,78 @@ using NativeExecutionParameters = Kernel::KThread::NativeExecutionParameters;
 
 constexpr size_t MaxRelativeBranch = 128_MiB;
 constexpr u32 ModuleCodeIndex = 0x24 / sizeof(u32);
+
+// Switch 2 titles are built with pointer authentication. Under NCE the guest runs natively on
+// the host, whose kernel enables real PAC keys (and FEAT_FPAC traps on a failed AUT*). Guest
+// pointers that never went through the host's signing (HLE-written contexts, relocations,
+// thread entry points, ...) then fail authentication and the process dies with SIGILL.
+// Rewrite every PAC instruction into its key-disabled equivalent so signing and checking are
+// both no-ops, which is consistent for the whole guest.
+static std::optional<u32> RewritePointerAuth(u32 inst) {
+    constexpr u32 Nop = 0xD503201F;
+    const u32 rn = (inst >> 5) & 0x1F;
+    const u32 rd = inst & 0x1F;
+
+    // HINT space: XPACLRI, PACIx1716, AUTIx1716, PACIxZ, PACIxSP, AUTIxZ, AUTIxSP.
+    if ((inst & 0xFFFFF01F) == 0xD503201F) {
+        const u32 imm = (inst >> 5) & 0x7F;
+        if (imm == 7 || imm == 8 || imm == 10 || imm == 12 || imm == 14 ||
+            (imm >= 24 && imm <= 31)) {
+            return Nop;
+        }
+        return std::nullopt;
+    }
+
+    // PACIA/PACIB/PACDA/PACDB/AUTIA/AUTIB/AUTDA/AUTDB and their Z variants (Xd modified in place).
+    if ((inst & 0xFFFFC000) == 0xDAC10000) {
+        return Nop;
+    }
+    // XPACI/XPACD.
+    if ((inst & 0xFFFFFBE0) == 0xDAC143E0) {
+        return Nop;
+    }
+
+    // RETAA/RETAB -> RET.
+    if (inst == 0xD65F0BFF || inst == 0xD65F0FFF) {
+        return 0xD65F03C0;
+    }
+    // BRAAZ/BRABZ/BLRAAZ/BLRABZ -> BR/BLR Xn.
+    if ((inst & 0xFFDFF81F) == 0xD61F081F) {
+        return ((inst & (1U << 21)) ? 0xD63F0000U : 0xD61F0000U) | (rn << 5);
+    }
+    // BRAA/BRAB/BLRAA/BLRAB Xn, Xm -> BR/BLR Xn.
+    if ((inst & 0xFFDFF800) == 0xD71F0800) {
+        return ((inst & (1U << 21)) ? 0xD63F0000U : 0xD61F0000U) | (rn << 5);
+    }
+
+    // LDRAA/LDRAB Xt, [Xn, #simm10*8]{!} -> LDR/LDUR with the same address.
+    if ((inst & 0xFF200400) == 0xF8200400) {
+        const u32 s = (inst >> 22) & 1;
+        const u32 imm9 = (inst >> 12) & 0x1FF;
+        const bool writeback = (inst >> 11) & 1;
+        s32 offset = static_cast<s32>((s << 9) | imm9);
+        if (offset & 0x200) {
+            offset -= 0x400;
+        }
+        offset *= 8;
+        if (writeback) {
+            if (offset >= -256 && offset <= 255) {
+                // LDR Xt, [Xn, #simm9]!
+                return 0xF8400C00U | ((static_cast<u32>(offset) & 0x1FF) << 12) | (rn << 5) | rd;
+            }
+        } else if (offset >= 0) {
+            // LDR Xt, [Xn, #uimm12*8]
+            return 0xF9400000U | ((static_cast<u32>(offset) / 8) << 10) | (rn << 5) | rd;
+        } else if (offset >= -256) {
+            // LDUR Xt, [Xn, #simm9]
+            return 0xF8400000U | ((static_cast<u32>(offset) & 0x1FF) << 12) | (rn << 5) | rd;
+        }
+        LOG_WARNING(Core_ARM, "NCE: cannot rewrite LDRAA/LDRAB {:08X} (offset {})", inst, offset);
+        return std::nullopt;
+    }
+
+    return std::nullopt;
+}
 
 Patcher::Patcher() : c(m_patch_instructions), c_pre(m_patch_instructions_pre) {
     // The first word of the patch section is always a branch to the first instruction of the
@@ -97,6 +171,15 @@ bool Patcher::PatchText(std::span<const u8> program_image, const Kernel::CodeSet
     const auto text = std::span{program_image}.subspan(code.offset, code.size);
     const auto text_words =
         std::span<const u32>{reinterpret_cast<const u32*>(text.data()), text.size() / sizeof(u32)};
+
+    // Real code can start before ModuleCodeIndex (e.g. Switch 2 main has a function at +0x20).
+    // Neutralize PAC there too, skipping only the entry branch and the MOD0 offset word, or a
+    // PACIBSP left there signs LR while its rewritten AUTIBSP no longer strips it.
+    for (u32 i = 2; i < std::min<u32>(ModuleCodeIndex, static_cast<u32>(text_words.size())); i++) {
+        if (const auto pac = RewritePointerAuth(text_words[i])) {
+            curr_patch->m_pac_rewrites.emplace_back(i, *pac);
+        }
+    }
 
     // Loop through instructions, patching as needed.
     for (u32 i = ModuleCodeIndex; i < static_cast<u32>(text_words.size()); i++) {
@@ -186,7 +269,17 @@ bool Patcher::PatchText(std::span<const u8> program_image, const Kernel::CodeSet
 
         if (auto exclusive = Exclusive{inst}; exclusive.Verify()) {
             curr_patch->m_exclusives.push_back(i);
+            continue;
         }
+
+        if (const auto pac = RewritePointerAuth(inst)) {
+            curr_patch->m_pac_rewrites.emplace_back(i, *pac);
+        }
+    }
+
+    if (!curr_patch->m_pac_rewrites.empty()) {
+        LOG_INFO(Core_ARM, "NCE: neutralized {} pointer-authentication instructions",
+                 curr_patch->m_pac_rewrites.size());
     }
 
     // Determine patching mode for the final relocation step
@@ -372,6 +465,10 @@ bool Patcher::RelocateAndCopy(Common::ProcessAddress load_base, const Kernel::Co
     for (const ModuleTextAddress i : patch.m_exclusives) {
         auto exclusive = Exclusive{text_words[i]};
         text_words[i] = exclusive.AsOrdered();
+    }
+
+    for (const auto& [i, word] : patch.m_pac_rewrites) {
+        text_words[i] = word;
     }
 
     // Remove the patched module size from the total. This is done so total_program_size

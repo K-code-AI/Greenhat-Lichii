@@ -218,9 +218,11 @@ object GpuDriverHelper {
         hookLibPath: String
     ): String?
 
+    // Custom drivers are no longer limited to Qualcomm, so detect Adreno directly from the KGSL
+    // device node. Freedreno/Turnip settings only apply to Adreno GPUs.
     fun isAdrenoGpu(): Boolean {
         return try {
-            supportsCustomDriverLoading()
+            File("/dev/kgsl-3d0").exists()
         } catch (e: Exception) {
             false
         }

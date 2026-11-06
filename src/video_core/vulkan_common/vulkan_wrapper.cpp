@@ -230,6 +230,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkGetQueryPoolResults);
     X(vkGetPipelineExecutablePropertiesKHR);
     X(vkGetPipelineExecutableStatisticsKHR);
+    X(vkGetPipelineExecutableInternalRepresentationsKHR);
     X(vkGetSemaphoreCounterValue);
     X(vkMapMemory);
     X(vkQueueBindSparse);
@@ -926,6 +927,46 @@ std::vector<VkPipelineExecutableStatisticKHR> Device::GetPipelineExecutableStati
     Check(dld->vkGetPipelineExecutableStatisticsKHR(handle, &executable_info, &num,
                                                     statistics.data()));
     return statistics;
+}
+
+std::vector<std::pair<std::string, std::string>>
+Device::GetPipelineExecutableInternalRepresentationsKHR(VkPipeline pipeline,
+                                                         u32 executable_index) const {
+    if (!dld->vkGetPipelineExecutableInternalRepresentationsKHR) {
+        return {};
+    }
+    const VkPipelineExecutableInfoKHR executable_info{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR,
+        .pNext = nullptr,
+        .pipeline = pipeline,
+        .executableIndex = executable_index,
+    };
+    u32 num{};
+    dld->vkGetPipelineExecutableInternalRepresentationsKHR(handle, &executable_info, &num,
+                                                           nullptr);
+    std::vector<VkPipelineExecutableInternalRepresentationKHR> representations(num);
+    for (auto& representation : representations) {
+        representation.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR;
+    }
+    // First call: the sizes; second: the text.
+    dld->vkGetPipelineExecutableInternalRepresentationsKHR(handle, &executable_info, &num,
+                                                           representations.data());
+    std::vector<std::vector<char>> storage(num);
+    for (u32 i = 0; i < num; ++i) {
+        storage[i].resize(representations[i].dataSize);
+        representations[i].pData = storage[i].data();
+    }
+    dld->vkGetPipelineExecutableInternalRepresentationsKHR(handle, &executable_info, &num,
+                                                           representations.data());
+    std::vector<std::pair<std::string, std::string>> result;
+    for (u32 i = 0; i < num; ++i) {
+        std::string text(storage[i].begin(), storage[i].end());
+        while (!text.empty() && text.back() == '\0') {
+            text.pop_back();
+        }
+        result.emplace_back(representations[i].name, std::move(text));
+    }
+    return result;
 }
 
 void Device::UpdateDescriptorSets(Span<VkWriteDescriptorSet> writes,

@@ -5,6 +5,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 add_library(yuzu-android SHARED
+    android_env_file.cpp
     emu_window/emu_window.cpp
     emu_window/emu_window.h
     native.cpp
