@@ -175,7 +175,15 @@ struct BufferCacheTestAccess {
     static Binding Bind(Cache& cache, Tegra::MemoryManager& memory, GPUVAddr descriptor,
                         bool written = false, bool native = false, bool table = false) {
         cache.gpu_memory = &memory;
-        return cache.StorageBufferBinding(descriptor, 0, written, native, table);
+        // The old (native, table) pair meant: size from the mapping when native, one contiguous
+        // device range when native or table, and the table pool rule when table.
+        return cache.StorageBufferBinding(
+            descriptor, 0, written,
+            VideoCommon::StorageBindingPolicy{
+                .size_from_mapping = native,
+                .require_contiguous = native || table,
+                .table_pointer = table,
+            });
     }
     static BufferId Add(Cache& cache, DAddr address, u32 size, bool mapped = false) {
         const auto id = cache.slot_buffers.insert(cache.runtime, address, size, mapped);
