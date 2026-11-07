@@ -292,7 +292,7 @@
   </action>
   <action name="action_About">
    <property name="text">
-    <string>&amp;About Lichii</string>
+    <string>&amp;About Greenhat-Lichii</string>
    </property>
   </action>
   <action name="action_Single_Window_Mode">

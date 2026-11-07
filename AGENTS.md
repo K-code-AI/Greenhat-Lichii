@@ -6,7 +6,7 @@ Keep comments to a reasonable level. Do not overexplain or add/remove comments f
 
 ## Game bug reports
 
-Users report game bugs with Lichii logs (`eden_log.txt`, `eden_log.txt.old`). Each `Booting game: <program id>` line starts a session; the build is on the first line (`Lichii Version: ... | nx2-<sha>`). Known program ids:
+Users report game bugs with Lichii logs (`eden_log.txt`, `eden_log.txt.old`). Each `Booting game: <program id>` line starts a session; the build is on the first line (`Greenhat-Lichii Version: ... | nx2-<sha>`). Known program ids:
 
 | Program id | Game |
 |---|---|

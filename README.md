@@ -7,20 +7,20 @@
 -->
 
 <p align="center">
-  <img src="dist/branding/lichii_icon_with_logo.png" alt="Lichii" width="600">
+  <img src="dist/branding/lichii_icon_with_logo.png" alt="Greenhat-Lichii" width="600">
 </p>
 
-# Lichii
+# Greenhat-Lichii
 
-Lichii is an experimental, open-source Nintendo Switch and Switch 2 emulator written in C++. It builds on Eglantine, Eden, yuzu and Sudachi, preserving their contributions while developing this fork's game compatibility and renderer fixes.
+Greenhat-Lichii is an experimental, open-source Nintendo Switch and Switch 2 emulator written in C++. It is a fork of [Lichii](https://github.com/zortos293/Lichii), and builds on Eglantine, Eden, yuzu and Sudachi, preserving their contributions while developing this fork's game compatibility and renderer fixes.
 
-This is an independent fork, not an official release of those upstream projects. Lichii is not affiliated with Nintendo.
+This is an independent fork, not an official release of those upstream projects. Greenhat-Lichii is not affiliated with Nintendo.
 
-Visit the [official Lichii website](https://lichii.zortos.me) to find games and compare community compatibility reports.
+The [Lichii website](https://lichii.zortos.me) is run by upstream Lichii; use it to find games and compare community compatibility reports.
 
 ## Downloads and setup
 
-Published builds belong on this fork's [releases page](https://github.com/zortos293/Eglantine/releases). The repository still uses its historical Eglantine name; the desktop application is now Lichii.
+Published builds of this fork are on the [Greenhat-Lichii releases page](https://github.com/K-code-AI/Greenhat-Lichii/releases). Upstream Lichii publishes its own builds separately; a Greenhat-Lichii build checks for updates against this fork's releases, not upstream's.
 
 On Windows, extract the entire build archive and run **lichii.exe**. Only use games and system files you have legally obtained. Games, keys and firmware are not included.
 
@@ -38,7 +38,7 @@ Desktop reporting requires a build containing [PR #303](https://github.com/zorto
 
 Confirm the matching website catalog entry and review the editable machine, game, setup, and enabled add-on details prefilled where available. Check the public preview and give explicit consent before submitting. Nothing uploads automatically, and the native v1 reporter does not read or upload logs or files.
 
-When [reporting an issue](https://github.com/zortos293/Eglantine/issues), include:
+When [reporting an issue](https://github.com/K-code-AI/Greenhat-Lichii/issues), include:
 
 - The exact build, game version, CPU, GPU and driver version.
 - Relevant settings and steps to reproduce the problem.
@@ -56,9 +56,9 @@ Keep changes focused and distinguish code-level checks from actual gameplay test
 Art created by YOB (yobslab)
 The supplied Lichii logo, icon and library artwork are in [dist/branding](dist/branding). Windows, Linux and macOS icon resources are generated from that artwork by [Generate-LichiiIcons.ps1](tools/Generate-LichiiIcons.ps1).
 
-## Support Lichii
+## Support upstream Lichii
 
-Lichii is free and stays free. If you want to help, you can donate in crypto. Donations help pay for the AI tools and build machines used to develop this open-source project faster.
+The wallets below belong to upstream Lichii, not to this fork. Greenhat-Lichii is free and stays free. If you want to help, you can donate in crypto. Donations help pay for the AI tools and build machines used to develop this open-source project faster.
 
 **Solana (SOL)**
 ```text
@@ -92,6 +92,6 @@ Send each coin on its matching network. Coins sent on the wrong network can't be
 
 ## Credits and license
 
-Lichii inherits the work of the Eglantine, Eden, yuzu and Sudachi projects and their contributors, including Eglantine's original developer Camille LaVey. Original copyright notices and third-party licenses are retained.
+Greenhat-Lichii inherits the work of the Lichii, Eglantine, Eden, yuzu and Sudachi projects and their contributors, including Eglantine's original developer Camille LaVey. Original copyright notices and third-party licenses are retained.
 
 See [LICENSE.txt](LICENSE.txt) and the source files for applicable license terms.

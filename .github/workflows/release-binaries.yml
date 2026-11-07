@@ -413,8 +413,8 @@ jobs:
           curl -fsSL -o "$tools/linuxdeploy-plugin-qt-$arch.AppImage" \
           https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-$arch.AppImage
           chmod +x "$tools"/*.AppImage
-          # The desktop file names its icon io.github.zortos293.lichii.
-          icon="$RUNNER_TEMP/io.github.zortos293.lichii.png"
+          # The desktop file names its icon io.github.k-code-ai.greenhat-lichii.
+          icon="$RUNNER_TEMP/io.github.k-code-ai.greenhat-lichii.png"
           cp dist/lichii.png "$icon"
           export APPIMAGE_EXTRACT_AND_RUN=1
           export QMAKE="$QT_ROOT_DIR/bin/qmake"
@@ -431,7 +431,7 @@ jobs:
           "$tools/linuxdeploy-$arch.AppImage" --appdir AppDir \
             --executable build/release/bin/lichii \
             --executable build/release/bin/eden-cli \
-            --desktop-file dist/io.github.zortos293.lichii.desktop \
+            --desktop-file dist/io.github.k-code-ai.greenhat-lichii.desktop \
             --icon-file "$icon" \
             --plugin qt \
             --output appimage

@@ -37,15 +37,17 @@ set(GIT_DESC ${BUILD_VERSION})
 
 # Generate cpp with Git revision from template
 
-set(BUILD_AUTO_UPDATE_STABLE_REPO "zortos293/Lichii")
+# The update checker reads this fork's releases, not the upstream project's. An empty
+# LICHII_UPDATER_REPO leaves the check off, which is what a local build wants anyway.
+set(BUILD_AUTO_UPDATE_STABLE_REPO "${LICHII_UPDATER_REPO}")
 set(BUILD_AUTO_UPDATE_STABLE_API "api.github.com")
-set(BUILD_AUTO_UPDATE_API_PATH "/repos/zortos293/Lichii/releases?per_page=100")
+set(BUILD_AUTO_UPDATE_API_PATH "/repos/${LICHII_UPDATER_REPO}/releases?per_page=100")
 set(BUILD_AUTO_UPDATE_WEBSITE "https://github.com")
-set(BUILD_AUTO_UPDATE_REPO "zortos293/Lichii")
+set(BUILD_AUTO_UPDATE_REPO "${LICHII_UPDATER_REPO}")
 if (NIGHTLY_BUILD)
-    set(REPO_NAME "Lichii Nightly")
+    set(REPO_NAME "${LICHII_DISPLAY_NAME} Nightly")
 else()
-    set(REPO_NAME "Lichii")
+    set(REPO_NAME "${LICHII_DISPLAY_NAME}")
 endif()
 
 set(BUILD_ID ${GIT_REFSPEC})
