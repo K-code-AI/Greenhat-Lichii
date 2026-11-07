@@ -58,6 +58,12 @@ std::optional<Common::Net::Release> SelectUpdate(std::span<const Common::Net::Re
 }
 
 CheckResult Check() {
+    // No configured feed means nothing to ask: a local build, or a fork that publishes no
+    // releases of its own. Stay quiet rather than offering someone else's binaries.
+    if (std::string_view{Common::g_build_auto_update_repo}.empty()) {
+        return {};
+    }
+
     if (!ParseBuildNumber(Common::g_build_release_tag) ||
         std::string_view{Common::g_build_release_platform}.empty()) {
         return {};

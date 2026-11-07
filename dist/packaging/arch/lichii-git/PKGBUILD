@@ -5,7 +5,7 @@ pkgver=0.r0.g0000000
 pkgrel=1
 pkgdesc='Nintendo Switch emulator (development branch)'
 arch=('x86_64')
-url='https://github.com/zortos293/lichii'
+url='https://github.com/K-code-AI/Greenhat-Lichii'
 license=('GPL-3.0-or-later')
 depends=(
   'enet'
@@ -43,7 +43,7 @@ optdepends=(
 )
 provides=('lichii')
 conflicts=('lichii')
-source=("lichii::git+https://github.com/zortos293/lichii.git#branch=nx2")
+source=("lichii::git+https://github.com/K-code-AI/Greenhat-Lichii.git#branch=nx2")
 sha256sums=('SKIP')
 
 pkgver() {

@@ -305,8 +305,8 @@ void UpdateDialog::InstallOnRestart(const std::filesystem::path& exe) {
 
     const auto button = QtCommon::Frontend::Question(
         tr("Update Ready"),
-        tr("Lichii will close, install the update and start again. The previous version is "
-           "kept, and your settings and data are not changed.\n\nRestart now?"),
+        tr("Greenhat-Lichii will close, install the update and start again. The previous "
+           "version is kept, and your settings and data are not changed.\n\nRestart now?"),
         QtCommon::Frontend::Yes | QtCommon::Frontend::No);
     if (button != QtCommon::Frontend::Yes ||
         !LaunchInstaller(parentWidget(), QString::fromStdWString(staging.wstring()))) {

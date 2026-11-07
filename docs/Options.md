@@ -61,6 +61,8 @@ These options control executables and build flavors.
 - `ENABLE_UPDATE_CHECKER` (OFF) Enable update checking functionality
   - `LICHII_BUILD_TAG` (empty) Published `build-N` tag. Builds without it never check for updates.
   - `LICHII_BUILD_PLATFORM` (empty) Release asset platform and variant, such as `linux-x86_64-pgo`. CI sets this from its build matrix.
+  - `LICHII_UPDATER_REPO` (`K-code-AI/Greenhat-Lichii`) `owner/repo` whose releases the update checker reads, and where the in-game news comes from. Empty disables both.
+  - `LICHII_DISPLAY_NAME` (`Greenhat-Lichii`) Product name in window titles, the About box and the log's first line.
 - `YUZU_DISABLE_LLVM` (OFF) Do not attempt to link to the LLVM demangler
   - Really only useful for CI or distribution builds
 

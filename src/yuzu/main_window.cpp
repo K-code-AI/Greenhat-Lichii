@@ -1939,9 +1939,9 @@ bool MainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPar
         case Core::SystemResultStatus::ErrorMemoryAllocation:
             QMessageBox::critical(
                 this, tr("Not enough memory to start the game"),
-                tr("Lichii could not allocate the game's memory. Close other applications and "
-                   "check that your system has enough available memory and paging-file space, "
-                   "then try again."));
+                tr("Greenhat-Lichii could not allocate the game's memory. Close other "
+                   "applications and check that your system has enough available memory and "
+                   "paging-file space, then try again."));
             break;
         case Core::SystemResultStatus::ErrorGetLoader:
             LOG_CRITICAL(Frontend, "Failed to obtain loader for {}!", filename.toStdString());
@@ -2035,7 +2035,7 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     if (close_pending) {
         return;
     }
-    LOG_INFO(Frontend, "Lichii starting...");
+    LOG_INFO(Frontend, "Greenhat-Lichii starting...");
     report_session.reset();
     game_list->SetReportableProgramId(0);
 
@@ -5338,7 +5338,7 @@ bool MainWindow::ConfirmClose() {
         return true;
 
     const auto text = tr("Are you sure you want to close Lichii?");
-    return question(this, tr("Lichii"), text);
+    return question(this, tr("Greenhat-Lichii"), text);
 }
 
 void MainWindow::closeEvent(QCloseEvent* event) {
@@ -5444,7 +5444,7 @@ bool MainWindow::ConfirmChangeGame() {
 
     // Use custom question to link controller navigation
     return question(
-        this, tr("Lichii"),
+        this, tr("Greenhat-Lichii"),
         tr("Are you sure you want to stop the emulation? Any unsaved progress will be lost."),
         QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
 }
@@ -5456,7 +5456,7 @@ bool MainWindow::ConfirmForceLockedExit() {
     const auto text = tr("The currently running application has requested Lichii to not exit.\n\n"
                          "Would you like to bypass this and exit anyway?");
 
-    return question(this, tr("Lichii"), text);
+    return question(this, tr("Greenhat-Lichii"), text);
 }
 
 void MainWindow::RequestGameExit() {

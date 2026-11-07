@@ -223,7 +223,8 @@ RequestResult Fetch(const std::string& url, const std::string& path) {
         httplib::Request request{
             .method = "GET",
             .path = path,
-            .headers = {{"Accept", "application/vnd.github+json"}, {"User-Agent", "Lichii"}},
+            .headers = {{"Accept", "application/vnd.github+json"},
+                        {"User-Agent", Common::g_build_name}},
         };
 
         client->set_follow_location(true);
@@ -257,11 +258,15 @@ std::optional<std::string> MakeRequest(const std::string& url, const std::string
 }
 
 ReleaseList GetReleases() {
+    if (std::string_view{Common::g_build_auto_update_stable_repo}.empty()) {
+        return {};
+    }
+
     const auto url = fmt::format("https://{}", Common::g_build_auto_update_stable_api);
     const auto response = Fetch(url, Common::g_build_auto_update_api_path);
 
     if (!response.body) {
-        LOG_WARNING(Common, "Failed to get Lichii releases");
+        LOG_WARNING(Common, "Failed to get {} releases", Common::g_build_name);
         return {.status = response.status};
     }
 
@@ -272,6 +277,10 @@ ReleaseList GetReleases() {
 }
 
 std::optional<std::string> GetReleasesBody() {
+    if (std::string_view{Common::g_build_auto_update_stable_repo}.empty()) {
+        return std::nullopt;
+    }
+
     const auto releases_path = Common::g_build_auto_update_api_path;
     const auto url = fmt::format("https://{}", Common::g_build_auto_update_stable_api);
 
