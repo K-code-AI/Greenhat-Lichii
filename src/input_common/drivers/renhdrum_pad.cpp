@@ -112,6 +112,7 @@ const RenHDrumApi& Api() {
 
 constexpr Uint16 NintendoVendorId = 0x057E;
 constexpr Uint16 SonyVendorId = 0x054C;
+constexpr Uint16 MicrosoftVendorId = 0x045E;
 constexpr std::array<Uint8, 10> NeutralPacket{0x10, 0, 0x00, 0x01, 0x40, 0x40, 0x00, 0x01, 0x40, 0x40};
 constexpr int DualSenseAudioMaxAttempts = 10;
 // SDL no-queue gap while the 5 ms envelope runs (Ryuhdr AmFmNoQueueGapMs)
@@ -124,12 +125,24 @@ bool IsSwitchHdController(Uint16 vid, Uint16 pid) {
 /// Xbox One / Series and Xbox 360 style pads, Microsoft's or not (GameSir, 8BitDo, PowerA...).
 /// RenHDrum's converter was tuned on an Xbox One S; others get the same four-motor mix, and
 /// a pad whose path has no trigger motors (XInput) keeps only the grips.
-bool IsXboxStyle(SDL_Gamepad* gamepad) {
-    if (!gamepad) {
-        return false;
+bool IsXboxStyle(SDL_Joystick* joystick, SDL_Gamepad* gamepad) {
+    if (gamepad) {
+        const SDL_GamepadType type = SDL_GetGamepadType(gamepad);
+        if (type == SDL_GAMEPAD_TYPE_XBOXONE || type == SDL_GAMEPAD_TYPE_XBOX360) {
+            return true;
+        }
     }
-    const SDL_GamepadType type = SDL_GetGamepadType(gamepad);
-    return type == SDL_GAMEPAD_TYPE_XBOXONE || type == SDL_GAMEPAD_TYPE_XBOX360;
+#ifdef _WIN32
+    // With raw input on, SDL types a third-party XInput pad by its vendor ID and may not call it
+    // an Xbox controller. Windows marks every XInput-capable HID device with "IG_" in its path.
+    const char* path = SDL_GetJoystickPath(joystick);
+    if (path && (std::strstr(path, "IG_") != nullptr || std::strstr(path, "ig_") != nullptr)) {
+        return true;
+    }
+#else
+    (void)joystick;
+#endif
+    return false;
 }
 
 bool IsDualSense(Uint16 vid, Uint16 pid) {
@@ -154,6 +167,7 @@ struct UserSettings {
     bool xbox_direct{false};
     int xbox_detail_mix{50};
     int xbox_hit_accents{50};
+    int xbox_trigger_mix{20};
     int gain{100};
     int low_boost{0};
     bool operator==(const UserSettings&) const = default;
@@ -179,6 +193,7 @@ UserSettings ReadUserSettings() {
         .xbox_direct = s.xbox_rumble_mode.GetValue() == 1,
         .xbox_detail_mix = std::clamp(s.xbox_detail_mix.GetValue(), 0, 100),
         .xbox_hit_accents = std::clamp(s.xbox_hit_accents.GetValue(), 0, 100),
+        .xbox_trigger_mix = std::clamp(s.xbox_trigger_mix.GetValue(), 0, 100),
         .gain = std::clamp(s.hd_rumble_gain.GetValue(), 25, 1000),
         .low_boost = std::clamp(s.hd_rumble_low_boost.GetValue(), 0, 100),
     };
@@ -204,6 +219,10 @@ float ShapeAmplitude(float amplitude, const UserSettings& u) {
 // Controllers RenHDrum drives, per kind, for the settings dialog
 std::array<std::atomic<int>, 3> connected_count{};
 std::atomic<int> last_connected_kind{-1};
+// Connected Xbox-style controllers that expose trigger motors
+std::atomic<int> xbox_trigger_pads{};
+// Connected official (Microsoft) Xbox controllers whose trigger motors SDL does not expose
+std::atomic<int> xbox_official_no_triggers{};
 
 } // namespace
 
@@ -234,6 +253,7 @@ struct RenHDrumPad::Impl {
 
     RenHdcXboxRumble* xbox{};
     bool xbox_triggers{};
+    bool official_no_triggers{};
     // Direct mode: the latest shaped bands of each side, and the grip values last sent
     std::array<float, 2> direct_low{};
     std::array<float, 2> direct_high{};
@@ -241,6 +261,9 @@ struct RenHDrumPad::Impl {
     // Direct mode accents: the level to settle on once the kick ends
     std::array<std::uint16_t, 2> direct_target{};
     std::int64_t kick_until_us{};
+    // Direct mode triggers: the fine vibration of each side, and what was last sent
+    std::array<std::uint16_t, 2> trigger_target{};
+    std::array<std::uint16_t, 2> trigger_sent{};
 
     std::mutex bt_dsp_mutex;
     SDL_hid_device* bt_hid{};
@@ -662,8 +685,10 @@ std::shared_ptr<RenHDrumPad> RenHDrumPad::Create(SDL_Joystick* joystick, SDL_Gam
     const bool switch_pad = IsSwitchHdController(vid, pid);
     const auto& api_check = Api();
     const bool xbox_pad = !switch_pad && !IsDualSense(vid, pid) && api_check.HasXbox() &&
-                          IsXboxStyle(gamepad);
+                          IsXboxStyle(joystick, gamepad);
     if (!switch_pad && !xbox_pad && !IsDualSense(vid, pid)) {
+        LOG_INFO(Input, "RenHDrum: {:04X}:{:04X} \"{}\" is not a controller RenHDrum drives",
+                 vid, pid, SDL_GetJoystickName(joystick) ? SDL_GetJoystickName(joystick) : "");
         return nullptr;
     }
 
@@ -708,6 +733,13 @@ std::shared_ptr<RenHDrumPad> RenHDrumPad::Create(SDL_Joystick* joystick, SDL_Gam
     }
     state->kind = xbox_pad ? 2 : switch_pad ? 0 : 1;
     ++connected_count[state->kind];
+    if (state->xbox_triggers) {
+        ++xbox_trigger_pads;
+    }
+    state->official_no_triggers = xbox_pad && vid == MicrosoftVendorId && !state->xbox_triggers;
+    if (state->official_no_triggers) {
+        ++xbox_official_no_triggers;
+    }
     last_connected_kind = state->kind;
     return std::shared_ptr<RenHDrumPad>(new RenHDrumPad(std::move(state)));
 }
@@ -723,6 +755,21 @@ int GetRenHDrumConnectedKind() {
         }
     }
     return -1;
+}
+
+int GetRenHDrumXboxTriggers() {
+    if (connected_count[2].load() == 0) {
+        return -1;
+    }
+    return xbox_trigger_pads.load() > 0 ? 1 : 0;
+}
+
+bool GetRenHDrumXboxNeedsRawInput() {
+#ifdef _WIN32
+    return xbox_official_no_triggers.load() > 0;
+#else
+    return false;
+#endif
 }
 
 RenHDrumPad::RenHDrumPad(std::unique_ptr<Impl> impl_) : impl{std::move(impl_)} {}
@@ -746,6 +793,12 @@ void RenHDrumPad::Shutdown() {
         had_xbox = impl->had_xbox;
         if (impl->kind >= 0) {
             --connected_count[impl->kind];
+            if (impl->xbox_triggers) {
+                --xbox_trigger_pads;
+            }
+            if (impl->official_no_triggers) {
+                --xbox_official_no_triggers;
+            }
             impl->kind = -1;
         }
         triggers = impl->xbox_triggers;
@@ -777,6 +830,8 @@ bool RenHDrumPad::Vibrate(std::int64_t now_us, bool is_right,
     bool engine_sample = false;
     bool send_direct = false;
     std::array<std::uint16_t, 2> direct{};
+    bool send_trigger = false;
+    std::array<std::uint16_t, 2> trigger{};
     {
         std::scoped_lock lock{impl->mutex};
         if (!impl->joystick) {
@@ -808,11 +863,23 @@ bool RenHDrumPad::Vibrate(std::int64_t now_us, bool is_right,
             const auto kicked = [accent](std::uint16_t t) {
                 return static_cast<std::uint16_t>(t + (65535.0f - t) * accent);
             };
+            // Triggers carry the fine vibration, left side on LT and right side on RT
+            const float trigger_mix = static_cast<float>(u.xbox_trigger_mix) / 100.0f;
+            const auto on_trigger = [trigger_mix](std::uint16_t v) {
+                return static_cast<std::uint16_t>(static_cast<float>(v) * trigger_mix);
+            };
+            const std::array<std::uint16_t, 2> trigger_full{to_motor(impl->direct_high[0]),
+                                                            to_motor(impl->direct_high[1])};
+            const std::array<std::uint16_t, 2> trigger_target{on_trigger(trigger_full[0]),
+                                                              on_trigger(trigger_full[1])};
             const bool kicking = impl->kick_until_us != 0 && now_us < impl->kick_until_us;
             if (!kicking && accent > 0.0f &&
                 (target[0] - impl->direct_target[0] >= KickRise ||
                  target[1] - impl->direct_target[1] >= KickRise)) {
                 impl->kick_until_us = now_us + KickUs;
+                trigger = {on_trigger(kicked(trigger_full[0])),
+                           on_trigger(kicked(trigger_full[1]))};
+                send_trigger = true;
                 direct = {target[0] - impl->direct_target[0] >= KickRise ? kicked(target[0])
                                                                          : target[0],
                           target[1] - impl->direct_target[1] >= KickRise ? kicked(target[1])
@@ -824,15 +891,24 @@ bool RenHDrumPad::Vibrate(std::int64_t now_us, bool is_right,
                     impl->kick_until_us = 0;
                     direct = target;
                     send_direct = true;
+                    trigger = trigger_target;
+                    send_trigger = true;
                 }
             } else {
                 impl->kick_until_us = 0;
                 direct = target;
                 send_direct = direct != impl->direct_sent;
+                trigger = trigger_target;
+                send_trigger = trigger != impl->trigger_sent;
             }
             impl->direct_target = target;
+            impl->trigger_target = trigger_target;
             if (send_direct) {
                 impl->direct_sent = direct;
+            }
+            send_trigger = send_trigger && impl->xbox_triggers;
+            if (send_trigger) {
+                impl->trigger_sent = trigger;
             }
             handled = true;
         } else if (impl->xbox) {
@@ -874,6 +950,9 @@ bool RenHDrumPad::Vibrate(std::int64_t now_us, bool is_right,
         // A stop always arrives as a zero; the duration only guards a lost one
         SDL_RumbleJoystick(joystick, direct[0], direct[1], 2000);
     }
+    if (send_trigger) {
+        SDL_RumbleJoystickTriggers(joystick, trigger[0], trigger[1], 2000);
+    }
     if (change.stop_engine) {
         SendNeutralPacket(joystick);
     }
@@ -896,6 +975,8 @@ void RenHDrumPad::Tick(std::int64_t now_us) {
     std::uint32_t strength = 100;
     bool send_settle = false;
     std::array<std::uint16_t, 2> settle{};
+    bool send_settle_trigger = false;
+    std::array<std::uint16_t, 2> settle_trigger{};
     std::array<std::uint16_t, 4> motors{};
     {
         std::scoped_lock lock{impl->mutex};
@@ -914,6 +995,12 @@ void RenHDrumPad::Tick(std::int64_t now_us) {
             settle = impl->direct_target;
             send_settle = settle != impl->direct_sent;
             impl->direct_sent = settle;
+            settle_trigger = impl->trigger_target;
+            send_settle_trigger =
+                impl->xbox_triggers && settle_trigger != impl->trigger_sent;
+            if (send_settle_trigger) {
+                impl->trigger_sent = settle_trigger;
+            }
         }
         send_xbox = impl->xbox && !impl->user.xbox_direct &&
                     Api().xbox_tick(impl->xbox, now_us, motors.data()) == 1;
@@ -922,6 +1009,9 @@ void RenHDrumPad::Tick(std::int64_t now_us) {
     }
     if (send_settle) {
         SDL_RumbleJoystick(joystick, settle[0], settle[1], 2000);
+    }
+    if (send_settle_trigger) {
+        SDL_RumbleJoystickTriggers(joystick, settle_trigger[0], settle_trigger[1], 2000);
     }
     if (send_xbox) {
         // RenHDrum's mix tops out near 10 % of the range (tuned on the Xbox One S motors);
@@ -968,6 +1058,14 @@ bool IsRenHDrumLoaded() {
 
 int GetRenHDrumConnectedKind() {
     return -1;
+}
+
+int GetRenHDrumXboxTriggers() {
+    return -1;
+}
+
+bool GetRenHDrumXboxNeedsRawInput() {
+    return false;
 }
 
 struct RenHDrumPad::Impl {};
