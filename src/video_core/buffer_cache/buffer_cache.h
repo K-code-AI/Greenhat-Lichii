@@ -393,6 +393,7 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
         if (staged.empty() && mapped.empty()) {
             return;
         }
+        const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
         if (staged.empty()) {
             if constexpr (has_mapped) {
                 runtime.FinishForHostRead();
@@ -411,7 +412,8 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
                 runtime.Finish();
             }
             for (const Download& download : staged) {
-                device_memory.WriteBlockUnsafe(
+                WriteDownloadedMemory(
+                    cpu_written,
                     slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset,
                     staging.mapped_span.data() + (download.copy.dst_offset - staging.offset),
                     download.copy.size);
@@ -420,9 +422,9 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
         if constexpr (has_mapped) {
             for (const Download& download : mapped) {
                 Buffer& buffer = slot_buffers[download.buffer_id];
-                device_memory.WriteBlockUnsafe(buffer.CpuAddr() + download.copy.src_offset,
-                                               buffer.Mapped().data() + download.copy.src_offset,
-                                               download.copy.size);
+                WriteDownloadedMemory(cpu_written, buffer.CpuAddr() + download.copy.src_offset,
+                                      buffer.Mapped().data() + download.copy.src_offset,
+                                      download.copy.size);
             }
         }
     }
@@ -724,8 +726,8 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
             }
         }
     }
-    channel_state->enabled_storage_buffers[stage] |= 1U << ssbo_index;
-    channel_state->written_storage_buffers[stage] |= (is_written ? 1U : 0U) << ssbo_index;
+    channel_state->enabled_storage_buffers[stage] |= u64{1} << ssbo_index;
+    channel_state->written_storage_buffers[stage] |= u64{is_written ? 1U : 0U} << ssbo_index;
     if constexpr (requires { runtime.ShouldLimitDynamicStorageBuffers(); }) {
         if (runtime.ShouldLimitDynamicStorageBuffers() && !already_enabled) {
             ++channel_state->total_graphics_storage_buffers;
@@ -813,8 +815,8 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
             }
         }
     }
-    channel_state->enabled_compute_storage_buffers |= 1U << ssbo_index;
-    channel_state->written_compute_storage_buffers |= (is_written ? 1U : 0U) << ssbo_index;
+    channel_state->enabled_compute_storage_buffers |= u64{1} << ssbo_index;
+    channel_state->written_compute_storage_buffers |= u64{is_written ? 1U : 0U} << ssbo_index;
     if constexpr (requires { runtime.ShouldLimitDynamicStorageBuffers(); }) {
         if (runtime.ShouldLimitDynamicStorageBuffers() && !already_enabled) {
             ++channel_state->total_compute_storage_buffers;
@@ -1014,6 +1016,43 @@ void BufferCache<P>::PopAsyncFlushes() {
 }
 
 template <class P>
+void BufferCache<P>::ClaimCpuWrites(std::span<const std::pair<DAddr, u64>> ranges) {
+    for (const auto& [device_addr, size] : ranges) {
+        if (IsRegionGpuModified(device_addr, size)) {
+            ClearDownload(device_addr, size);
+            gpu_modified_ranges.Subtract(device_addr, size);
+        }
+    }
+}
+
+template <class P>
+Common::RangeSet<DAddr> BufferCache<P>::PendingCpuWriteRanges() {
+    Common::RangeSet<DAddr> ranges;
+    if (pending_cpu_writes) {
+        pending_cpu_writes(
+            [&ranges](DAddr device_addr, size_t size) { ranges.Add(device_addr, size); });
+    }
+    return ranges;
+}
+
+template <class P>
+void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written,
+                                           DAddr device_addr, const u8* data, u64 size) {
+    if (!cpu_written.Intersects(device_addr, size)) {
+        device_memory.WriteBlockUnsafe(device_addr, data, size);
+        return;
+    }
+    Common::RangeSet<DAddr> parts;
+    parts.Add(device_addr, size);
+    cpu_written.ForEachInRange(device_addr, size, [&parts](DAddr start, DAddr end) {
+        parts.Subtract(start, end - start);
+    });
+    parts.ForEach([&](DAddr start, DAddr end) {
+        device_memory.WriteBlockUnsafe(start, data + (start - device_addr), end - start);
+    });
+}
+
+template <class P>
 void BufferCache<P>::PopAsyncBuffers() {
     if (async_buffers.empty()) {
         return;
@@ -1027,6 +1066,9 @@ void BufferCache<P>::PopAsyncBuffers() {
     auto& async_buffer = async_buffers.front();
     u8* base = async_buffer->mapped_span.data();
     const size_t base_offset = async_buffer->offset;
+    // This runs on the fencing thread while the CPU keeps writing: CPU writes collected since the
+    // copy was taken are newer than it, and the GPU thread hasn't dropped them from `ranges` yet.
+    const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
     for (const auto& copy : downloads) {
         const DAddr device_addr = static_cast<DAddr>(copy.src_offset);
         const u64 dst_offset = copy.dst_offset - base_offset;
@@ -1034,8 +1076,8 @@ void BufferCache<P>::PopAsyncBuffers() {
         // Only what no write replaced since the copy was taken: the rest is older than guest
         // memory (CPU writes) or than the GPU's copy (GPU writes, still to be downloaded).
         ranges.ForEachInRange(device_addr, copy.size, [&](DAddr start, DAddr end) {
-            device_memory.WriteBlockUnsafe(start, &read_mapped_memory[start - device_addr],
-                                           end - start);
+            WriteDownloadedMemory(cpu_written, start, &read_mapped_memory[start - device_addr],
+                                  end - start);
             gpu_modified_ranges.Subtract(start, end - start);
         });
     }
@@ -2702,10 +2744,12 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
     }
     runtime.Finish();
     const u8* const mapped_memory = download_staging.mapped_span.data();
+    const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
     for (const Download& download : downloads) {
         const DAddr device_addr = slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset;
-        device_memory.WriteBlockUnsafe(
-            device_addr, mapped_memory + (download.copy.dst_offset - download_staging.offset),
+        WriteDownloadedMemory(
+            cpu_written, device_addr,
+            mapped_memory + (download.copy.dst_offset - download_staging.offset),
             download.copy.size);
     }
 }
@@ -2740,13 +2784,14 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
     if (total_size_bytes == 0) {
         return;
     }
+    const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
 
     if constexpr (requires { buffer.Mapped(); }) {
         if (const auto mapped = buffer.Mapped(); !mapped.empty()) {
             runtime.FinishForHostRead();
             for (const BufferCopy& copy : copies) {
-                device_memory.WriteBlockUnsafe(buffer.CpuAddr() + copy.src_offset,
-                                               mapped.data() + copy.src_offset, copy.size);
+                WriteDownloadedMemory(cpu_written, buffer.CpuAddr() + copy.src_offset,
+                                      mapped.data() + copy.src_offset, copy.size);
             }
             return;
         }
@@ -2767,14 +2812,14 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
             // Undo the modified offset
             const u64 dst_offset = copy.dst_offset - download_staging.offset;
             const u8* copy_mapped_memory = mapped_memory + dst_offset;
-            device_memory.WriteBlockUnsafe(copy_device_addr, copy_mapped_memory, copy.size);
+            WriteDownloadedMemory(cpu_written, copy_device_addr, copy_mapped_memory, copy.size);
         }
     } else {
         const std::span<u8> immediate_buffer = ImmediateBuffer(largest_copy);
         for (const BufferCopy& copy : copies) {
             buffer.ImmediateDownload(copy.src_offset, immediate_buffer.subspan(0, copy.size));
             const DAddr copy_device_addr = buffer.CpuAddr() + copy.src_offset;
-            device_memory.WriteBlockUnsafe(copy_device_addr, immediate_buffer.data(), copy.size);
+            WriteDownloadedMemory(cpu_written, copy_device_addr, immediate_buffer.data(), copy.size);
         }
     }
 }
@@ -2901,90 +2946,96 @@ void BufferCache<P>::TraceTablePointer(bool compute, size_t stage, size_t ssbo_i
 template <class P>
 Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written,
                                              StorageBindingPolicy policy) const {
-                                                 const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
+    const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
 
-                                                 if (gpu_addr == 0) {
-                                                     return NULL_BINDING;
-                                                 }
+    if (gpu_addr == 0) {
+        return NULL_BINDING;
+    }
 
-                                                 const u32 memory_layout_size = static_cast<u32>(gpu_memory->GetMemoryLayoutSize(gpu_addr));
-                                                 const u64 next_qword = policy.ReadsSizeWord(is_written)
-                                                 ? gpu_memory->Read<u64>(ssbo_addr + 8)
-                                                 : 0;
-                                                 const u32 alignment = runtime.GetStorageBufferAlignment();
+    const u64 next_qword = policy.ReadsSizeWord(is_written) ? gpu_memory->Read<u64>(ssbo_addr + 8) : 0;
+    const u32 alignment = runtime.GetStorageBufferAlignment();
 
-                                                 struct CachedBinding {
-                                                     size_t owner{};
-                                                     GPUVAddr gpu_addr{};
-                                                     u64 next_qword{};
-                                                     u64 serial{};
-                                                     u32 alignment{};
-                                                     u32 flags{};
-                                                     Binding binding{};
-                                                 };
+    struct CachedBinding {
+        size_t owner{};
+        GPUVAddr gpu_addr{};
+        u64 next_qword{};
+        u64 serial{};
+        u32 alignment{};
+        u32 flags{};
+        Binding binding{};
+    };
 
-                                                 constexpr size_t ways = 4;
-                                                 thread_local std::array<std::array<CachedBinding, ways>, 512> binding_cache{};
+    constexpr size_t ways = 4;
+    thread_local std::array<std::array<CachedBinding, ways>, 512> binding_cache{};
 
-                                                 const u32 flags = (is_written ? 1U : 0U) | (policy.size_from_mapping ? 2U : 0U) |
-                                                 (policy.table_pointer ? 4U : 0U) |
-                                                 (policy.require_contiguous ? 8U : 0U);
-                                                 const size_t owner = gpu_memory->GetID() + 1;
-                                                 const u64 serial = gpu_memory->MapSerial();
+    // Every field the size below can depend on, so a hit can never carry another policy's binding.
+    const u32 flags = (is_written ? 1U : 0U) | (policy.native_pointer ? 2U : 0U) |
+                      (policy.table_pointer ? 4U : 0U) | (policy.require_contiguous ? 8U : 0U) |
+                      (policy.size_from_mapping ? 16U : 0U);
+    const size_t owner = gpu_memory->GetID() + 1;
+    const u64 serial = gpu_memory->MapSerial();
 
-                                                 auto& set = binding_cache[((gpu_addr ^ next_qword ^ flags) * 0x9E3779B97F4A7C15ULL) >> 55];
+    auto& set = binding_cache[((gpu_addr ^ next_qword ^ flags) * 0x9E3779B97F4A7C15ULL) >> 55];
 
-                                                 for (size_t way = 0; way < ways; ++way) {
-                                                     const CachedBinding& cached = set[way];
-                                                     if (cached.owner == owner && cached.gpu_addr == gpu_addr &&
-                                                         cached.next_qword == next_qword && cached.serial == serial &&
-                                                         cached.alignment == alignment && cached.flags == flags && !Nx2Perf::Verify()) {
-                                                         const Binding hit = cached.binding;
-                                                     std::rotate(set.begin(), set.begin() + way, set.begin() + way + 1);
-                                                     return hit;
-                                                         }
-                                                 }
+    for (size_t way = 0; way < ways; ++way) {
+        const CachedBinding& cached = set[way];
+        if (cached.owner == owner && cached.gpu_addr == gpu_addr &&
+            cached.next_qword == next_qword && cached.serial == serial &&
+            cached.alignment == alignment && cached.flags == flags && !Nx2Perf::Verify()) {
+            const Binding hit = cached.binding;
+            std::rotate(set.begin(), set.begin() + way, set.begin() + way + 1);
+            return hit;
+        }
+    }
 
-                                                 u32 size = policy.Size(memory_layout_size, next_qword, is_written);
+    // Only a miss pays for the page-table walk behind the mapping size.
+    const u32 memory_layout_size = static_cast<u32>((std::min)(
+        u64{gpu_memory->GetMemoryLayoutSize(gpu_addr)}, u64{(std::numeric_limits<u32>::max)()}));
 
-                                                 if (policy.require_contiguous && size != 0) {
-                                                     size = static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr, size));
-                                                 }
+    u32 size =
+        policy.Size(memory_layout_size, next_qword, is_written, runtime.GetMaxStorageBufferRange());
 
-                                                 const GPUVAddr aligned_gpu_addr = Common::AlignDown(gpu_addr, alignment);
-                                                 const u32 aligned_size = static_cast<u32>(gpu_addr - aligned_gpu_addr) + size;
+    if (policy.require_contiguous && size != 0) {
+        // Stop where the mapping or its device range does: the binding is one device range, and
+        // a written one isn't split into separate ranges without sparse sources.
+        size = static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr, size));
+    }
 
-                                                 const std::optional<DAddr> aligned_device_addr =
-                                                 gpu_memory->GpuToCpuAddress(aligned_gpu_addr);
+    // Alignment only applies to the offset of the buffer
+    const GPUVAddr aligned_gpu_addr = Common::AlignDown(gpu_addr, alignment);
+    const u32 aligned_size = static_cast<u32>(gpu_addr - aligned_gpu_addr) + size;
 
-                                                 if (!aligned_device_addr || size == 0) {
-                                                     LOG_DEBUG(HW_GPU, "Failed to find storage buffer for cbuf index {}", cbuf_index);
-                                                     return NULL_BINDING;
-                                                 }
+    const std::optional<DAddr> aligned_device_addr = gpu_memory->GpuToCpuAddress(aligned_gpu_addr);
 
-                                                 const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
-                                                 ASSERT_MSG(device_addr, "Unaligned storage buffer address not found for cbuf index {}",
-                                                            cbuf_index);
+    if (!aligned_device_addr || size == 0) {
+        LOG_DEBUG(HW_GPU, "Failed to find storage buffer for cbuf index {}", cbuf_index);
+        return NULL_BINDING;
+    }
 
-                                                 const DAddr cpu_end = Common::AlignUp(*device_addr + size, Core::DEVICE_PAGESIZE);
+    const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+    ASSERT_MSG(device_addr, "Unaligned storage buffer address not found for cbuf index {}",
+               cbuf_index);
 
-                                                 u32 binding_size = static_cast<u32>(cpu_end - *aligned_device_addr);
-                                                 if (is_written) {
-                                                     binding_size = aligned_size;
-                                                 }
+    // The end address used for size calculation does not need to be aligned
+    const DAddr cpu_end = Common::AlignUp(*device_addr + size, Core::DEVICE_PAGESIZE);
 
-                                                 const Binding binding{
-                                                     .device_addr = *aligned_device_addr,
-                                                     .gpu_addr = aligned_gpu_addr,
-                                                     .size = binding_size,
-                                                     .buffer_id = BufferId{},
-                                                 };
+    u32 binding_size = static_cast<u32>(cpu_end - *aligned_device_addr);
+    if (is_written) {
+        binding_size = aligned_size;
+    }
 
-                                                 std::rotate(set.begin(), set.end() - 1, set.end());
-                                                 set[0] = {owner, gpu_addr, next_qword, serial, alignment, flags, binding};
+    const Binding binding{
+        .device_addr = *aligned_device_addr,
+        .gpu_addr = aligned_gpu_addr,
+        .size = binding_size,
+        .buffer_id = BufferId{},
+    };
 
-                                                 return binding;
-                                             }
+    std::rotate(set.begin(), set.end() - 1, set.end());
+    set[0] = {owner, gpu_addr, next_qword, serial, alignment, flags, binding};
+
+    return binding;
+}
 
 template <class P>
 TextureBufferBinding BufferCache<P>::GetTextureBufferBinding(GPUVAddr gpu_addr, u32 size,
