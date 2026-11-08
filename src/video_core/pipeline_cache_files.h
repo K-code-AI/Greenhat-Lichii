@@ -58,6 +58,9 @@ inline bool AdoptLegacyPipelineCache(const std::filesystem::path& legacy,
     return !error;
 }
 
+/// Copies a cache whose records this build reads, written with another cache version, to
+/// `destination` with this build's version in its header (from zortos293/Lichii#194). The
+/// source is never changed; an existing destination is kept.
 inline bool CopyCompatiblePipelineCache(const std::filesystem::path& source,
                                         const std::filesystem::path& destination,
                                         const std::array<char, 8>& magic, u32 source_version,

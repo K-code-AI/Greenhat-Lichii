@@ -355,6 +355,9 @@ void Fsr3FrameGen::Process(const Device& device, Scheduler& scheduler, VkImage c
     };
 
     scheduler.Record([this, constants, current_frame, flow_w, flow_h](vk::CommandBuffer cmdbuf) {
+        // The last real frame becomes the history and this one the current copy, before the flow
+        // reads them: Generate() interpolates between the two. Copying the new frame into both
+        // after the flow made every generated frame the newest frame blended with itself.
         CopyImageToImage(cmdbuf, *m_current_image, *m_history_image, m_extent);
         CopyImageToImage(cmdbuf, current_frame, *m_current_image, m_extent);
 

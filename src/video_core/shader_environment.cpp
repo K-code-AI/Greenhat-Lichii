@@ -313,6 +313,8 @@ size_t GenericEnvironment::ReadSizeBytes() const noexcept {
 }
 
 bool GenericEnvironment::CanBeSerialized() const noexcept {
+    // A trap guard is checked against live constants on every dispatch (ComputeShader), so a
+    // cached pipeline is only used once its guard passes (zortos293/Lichii#192, SinCuri0).
     return !has_unbound_instructions;
 }
 
@@ -391,6 +393,7 @@ void GenericEnvironment::Serialize(std::ofstream& file) const {
                        sizeof(gp_passthrough_mask));
         }
         if (stage == Shader::Stage::Task || stage == Shader::Stage::Mesh) {
+            // Task and mesh programs are translated with these (none were stored before).
             file.write(reinterpret_cast<const char*>(&mesh_registers), sizeof(mesh_registers))
                 .write(reinterpret_cast<const char*>(&mesh_primitive_header),
                        sizeof(mesh_primitive_header));

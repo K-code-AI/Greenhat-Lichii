@@ -115,6 +115,17 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     }
     system = &system_;
     check_owner = std::getenv("EDEN_NX2_SPLIT_CHECK") != nullptr;
+    static const bool switches_read = [] {
+        const auto on = [](const char* name) {
+            const char* value = std::getenv(name);
+            return value != nullptr && value[0] != '0';
+        };
+        macro_sink = on("EDEN_NX2_MACRO_SINK");
+        compute_sink = on("EDEN_NX2_COMPUTE_SINK");
+        ring_pairs = on("EDEN_NX2_RING_PAIRS");
+        return true;
+    }();
+    (void)switches_read;
     ring = std::make_unique<u64[]>(RingWords);
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
     active = true;
@@ -140,11 +151,20 @@ void GpuSplit::Stop() {
     ring.reset();
     write_position = 0;
     last_writer_position = 0;
+    last_memory_writer_position = 0;
+    pending_write_count = 0;
+    async_writes.clear();
     last_sync_position = 0;
+    last_memory_write_position = 0;
+    previous_memory_write_position = 0;
+    ranged_writes.clear();
+    writes.Reset();
     published_local = 0;
     consumed_cache = 0;
     publish_every = PublishEvery;
     front_engine = nullptr;
+    pairs_header = nullptr;
+    pairs_count = 0;
     back_engine = nullptr;
     front_macros = false;
     published.store(0, std::memory_order_relaxed);
@@ -187,6 +207,8 @@ void GpuSplit::WaitForSpace(size_t words) {
 }
 
 void GpuSplit::Publish() {
+    // The back may read what is published: the open Pairs block is final from here on.
+    pairs_header = nullptr;
     if (published_local == write_position) {
         return;
     }
@@ -197,6 +219,33 @@ void GpuSplit::Publish() {
         wake.fetch_add(1, std::memory_order_seq_cst);
         wake.notify_one();
     }
+    if ((macro_sink || compute_sink || ring_pairs) && (++publishes & 1023) == 0) [[unlikely]] {
+        ReportBatched();
+    }
+}
+
+void GpuSplit::ReportBatched() {
+    const auto now = std::chrono::steady_clock::now();
+    if (batched_since == std::chrono::steady_clock::time_point{}) {
+        batched_since = now;
+        batched.fill(0);
+        return;
+    }
+    const std::chrono::duration<double> elapsed = now - batched_since;
+    if (elapsed.count() < 10.0) {
+        return;
+    }
+    const auto rate = [&](Batched counter) {
+        return static_cast<double>(batched[static_cast<size_t>(counter)]) / elapsed.count();
+    };
+    LOG_INFO(HW_GPU,
+             "GPU split batched writes per second: split_batch.macro_sunk {:.0f}, "
+             "split_batch.compute_sunk {:.0f}, split_batch.compute_same {:.0f}, "
+             "split_batch.pairs {:.0f} in split_batch.pair_blocks {:.0f}",
+             rate(Batched::MacroSunk), rate(Batched::ComputeSunk), rate(Batched::ComputeSame),
+             rate(Batched::Pairs), rate(Batched::PairBlocks));
+    batched.fill(0);
+    batched_since = now;
 }
 
 void GpuSplit::Drain(DrainSite site) {
@@ -206,6 +255,7 @@ void GpuSplit::Drain(DrainSite site) {
     }
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
+    Common::Nx2Timeline::Span timeline_span{drain_site_names[static_cast<size_t>(site)]};
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
     // Everything consumed is not enough: the back submits deferred work (Scheduler::DeferFlush)
     // from its idle hook afterwards, and the caller may use the scheduler once this returns.
@@ -231,8 +281,300 @@ bool GpuSplit::WaitForWriters() {
     return WaitFor(std::min(last_writer_position, write_position), DrainSite::ListWriters);
 }
 
+bool GpuSplit::WaitForMemoryWriters() {
+    const u64 target = (std::max)(last_writer_position, last_memory_writer_position);
+    return WaitFor((std::min)(target, write_position), DrainSite::MacroDmaRead);
+}
+
+bool GpuSplit::WaitForWritesTo(u64 begin, u64 size) {
+    consumed_cache = consumed.load(std::memory_order_acquire);
+    const u64 end = begin + size;
+    const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
+    u64 target = 0;
+    u64 scanned = 0;
+    for (; scanned < remembered; ++scanned) {
+        const PendingWrite& write =
+            pending_writes[(pending_write_count - 1 - scanned) % pending_writes.size()];
+        if (write.position <= consumed_cache) {
+            break;
+        }
+        if (write.begin < end && begin < write.end) {
+            target = (std::max)(target, write.position);
+        }
+    }
+    if (scanned == pending_writes.size()) {
+        return false;
+    }
+    if (target != 0) {
+        WaitFor(target, DrainSite::MacroDmaRead);
+    }
+    return true;
+}
+
+bool GpuSplit::HasQueuedWritesTo(u64 begin, u64 size) {
+    consumed_cache = consumed.load(std::memory_order_acquire);
+    const u64 end = begin + size;
+    const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
+    for (u64 scanned = 0; scanned < remembered; ++scanned) {
+        const PendingWrite& write =
+            pending_writes[(pending_write_count - 1 - scanned) % pending_writes.size()];
+        if (write.position <= consumed_cache) {
+            return false;
+        }
+        if (write.begin < end && begin < write.end) {
+            return true;
+        }
+    }
+    return remembered == pending_writes.size();
+}
+
+bool GpuSplit::OverlayQueuedWrites(u64 since, u64 begin, u32* out, u32 words) {
+    if ((begin & 3) != 0) {
+        return false;
+    }
+    const u64 end = begin + u64{words} * sizeof(u32);
+    const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
+    // Newest first, back to what the back had consumed before guest memory was read.
+    std::array<u32, 64> overlapping;
+    u32 found = 0;
+    u64 scanned = 0;
+    for (; scanned < remembered; ++scanned) {
+        const u64 index = (pending_write_count - 1 - scanned) % pending_writes.size();
+        const PendingWrite& write = pending_writes[index];
+        if (write.position <= since) {
+            break;
+        }
+        if (write.begin < end && begin < write.end) {
+            if (write.words == 0 || (write.begin & 3) != 0 || found == overlapping.size()) {
+                // EDEN_NX2_OVERLAY_TRACE: which queued writes keep reads waiting.
+                static const bool trace = std::getenv("EDEN_NX2_OVERLAY_TRACE") != nullptr;
+                static std::atomic<u32> traced{};
+                if (trace && traced.fetch_add(1, std::memory_order_relaxed) < 48) {
+                    LOG_INFO(HW_GPU, "overlay: read {:#x}+{} blocked by {} write {:#x}-{:#x}",
+                             begin, words * 4, write.what, write.begin, write.end);
+                }
+                return false;
+            }
+            overlapping[found++] = static_cast<u32>(index);
+        }
+    }
+    if (scanned == pending_writes.size()) {
+        static const bool trace = std::getenv("EDEN_NX2_OVERLAY_TRACE") != nullptr;
+        static std::atomic<u32> traced{};
+        if (trace && traced.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_INFO(HW_GPU, "overlay: read {:#x} with over {} queued writes", begin,
+                     pending_writes.size());
+        }
+        return false;
+    }
+    for (u32 i = found; i-- > 0;) {
+        const PendingWrite& write = pending_writes[overlapping[i]];
+        for (u32 w = 0; w < write.words; ++w) {
+            const u64 address = write.begin + u64{w} * sizeof(u32);
+            if (address >= begin && address < end) {
+                out[(address - begin) / sizeof(u32)] = write.data[w];
+            }
+        }
+    }
+    return true;
+}
+
 bool GpuSplit::WaitForSync() {
     return WaitFor(std::min(last_sync_position, write_position), DrainSite::ListSync);
+}
+
+void GpuSplit::RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data, size_t space) {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_RANGED_WAITS");
+        return value == nullptr || value[0] != '0';
+    }();
+    // Only the method that was just sent: anything after it keeps its unranged mark.
+    if (!enabled || begin >= end || last_memory_write_position != write_position) {
+        return;
+    }
+    const u32 method = last_memory_write_method;
+    last_memory_write_position = previous_memory_write_position;
+    last_memory_write_method = previous_memory_write_method;
+    static const bool forward = [] {
+        const char* const value = std::getenv("EDEN_NX2_FORWARD_READS");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!forward) {
+        data = nullptr;
+    }
+    const size_t words = static_cast<size_t>(end - begin) / sizeof(u32);
+    // Consecutive uploads continue one range (each word may use another of the 16 data methods).
+    if (!ranged_writes.empty()) {
+        RangedWrite& last = ranged_writes.back();
+        if (last.end == begin) {
+            last.end = end;
+            last.position = write_position;
+            last.method = method;
+            if (data != nullptr && last.space == space && space != 0 &&
+                last.data.size() * sizeof(u32) == static_cast<size_t>(begin - last.begin)) {
+                last.data.insert(last.data.end(), data, data + words);
+            } else {
+                last.space = 0;
+                last.data.clear();
+            }
+            return;
+        }
+    }
+    if (ranged_writes.size() >= MaxRangedWrites()) {
+        // Too many in flight: the oldest counts for every read again.
+        const RangedWrite& oldest = ranged_writes.front();
+        if (oldest.position > last_memory_write_position) {
+            last_memory_write_position = oldest.position;
+            last_memory_write_method = oldest.method;
+        }
+        ranged_writes.pop_front();
+    }
+    RangedWrite& write = ranged_writes.emplace_back(RangedWrite{write_position, begin, end, method, 0, {}});
+    if (data != nullptr && space != 0 && (end - begin) % sizeof(u32) == 0) {
+        write.space = space;
+        write.data.assign(data, data + words);
+    }
+}
+
+bool GpuSplit::ForwardRead(size_t space, GPUVAddr begin, u32 words, u32* out) {
+    const GPUVAddr end = begin + GPUVAddr{words} * sizeof(u32);
+    const u64 done = consumed.load(std::memory_order_acquire);
+    u32 method{};
+    const u64 target = MemoryWriterTarget(done, begin, end, method);
+    if (target <= done) {
+        return false; // Nothing to wait for: memory holds the words
+    }
+    // The newest overlapping write; the deque is in send order.
+    for (auto it = ranged_writes.rbegin(); it != ranged_writes.rend(); ++it) {
+        if (!(it->begin < end && begin < it->end)) {
+            continue;
+        }
+        if (it->position != target || it->space != space || space == 0 || begin < it->begin ||
+            end > it->end || (begin - it->begin) % sizeof(u32) != 0 ||
+            it->data.size() * sizeof(u32) != static_cast<size_t>(it->end - it->begin)) {
+            return false;
+        }
+        std::memcpy(out, it->data.data() + (begin - it->begin) / sizeof(u32),
+                    size_t{words} * sizeof(u32));
+        return true;
+    }
+    return false;
+}
+
+u64 GpuSplit::MemoryWriterTarget(u64 done, GPUVAddr begin, GPUVAddr end, u32& target_method) {
+    while (!ranged_writes.empty() && ranged_writes.front().position <= done) {
+        ranged_writes.pop_front();
+    }
+    u64 target = std::max({last_writer_position, last_sync_position, last_memory_write_position});
+    target_method = last_memory_write_method;
+    // Newest first (positions rise along the deque): the first overlap is the target, and the
+    // writes before `target` can't raise it.
+    for (auto it = ranged_writes.rbegin(); it != ranged_writes.rend() && it->position > target;
+         ++it) {
+        if (it->begin < end && begin < it->end) {
+            target = it->position;
+            target_method = it->method;
+            break;
+        }
+    }
+    return std::min(target, write_position);
+}
+
+size_t GpuSplit::MaxRangedWrites() {
+    // 256 overflowed in Ocarina of Time (thousands of constant buffer uploads a frame): the
+    // oldest then counted for every semaphore acquire and macro memory read, which waited for
+    // the back to reach it.
+    static const size_t max = [] {
+        const char* const value = std::getenv("EDEN_NX2_RANGED_MAX");
+        return value != nullptr ? (std::max<size_t>)(std::strtoull(value, nullptr, 10), 1) : 256;
+    }();
+    return max;
+}
+
+bool GpuSplit::HasQueuedMemoryWriters(GPUVAddr begin, GPUVAddr end) {
+    const u64 done = consumed.load(std::memory_order_acquire);
+    u32 method{};
+    return MemoryWriterTarget(done, begin, end, method) > done;
+}
+
+u32 GpuSplit::QueuedWriterKind(GPUVAddr begin, GPUVAddr end, u32& method) {
+    const u64 done = consumed.load(std::memory_order_acquire);
+    const u64 target = MemoryWriterTarget(done, begin, end, method);
+    if (target <= done) {
+        return 0;
+    }
+    return target == last_writer_position         ? 1
+           : target == last_sync_position         ? 2
+           : target == last_memory_write_position ? 3
+                                                  : 4;
+}
+
+void GpuSplit::NoteRelease(u64 device, GPUVAddr address, u32 payload) {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_ACQUIRE_QUEUED");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!enabled) {
+        return;
+    }
+    queued_releases[(device >> 2) % queued_releases.size()] = {write_position, device, payload};
+}
+
+std::optional<u32> GpuSplit::QueuedReleasePayload(u64 device, GPUVAddr address, u32* miss) {
+    const QueuedRelease& release = queued_releases[(device >> 2) % queued_releases.size()];
+    const u64 done = consumed.load(std::memory_order_acquire);
+    if (release.device != device || release.position == 0) {
+        if (miss) *miss = 1;
+        return std::nullopt;
+    }
+    if (release.position <= done) {
+        if (miss) *miss = 2;
+        return std::nullopt;
+    }
+    // Any write sent after the release (an unranged one, or a ranged one to the word) may change
+    // the word before the acquire runs.
+    u32 method{};
+    if (MemoryWriterTarget(done, address, address + sizeof(u32), method) > release.position) {
+        if (miss) *miss = 3;
+        return std::nullopt;
+    }
+    return release.payload;
+}
+
+bool GpuSplit::WaitForMemoryWriters(DrainSite site, GPUVAddr begin, GPUVAddr end) {
+    const u64 done = consumed.load(std::memory_order_acquire);
+    u32 target_method{};
+    const u64 target = MemoryWriterTarget(done, begin, end, target_method);
+    const u64 unranged =
+        std::max({last_writer_position, last_sync_position, last_memory_write_position});
+    if (Nx2Profile::Enabled()) {
+        // What the read waits for: the newest writer it depends on.
+        using Cause = Nx2Profile::DmaWaitCause;
+        const u64 all_writes =
+            ranged_writes.empty() ? unranged : std::max(unranged, ranged_writes.back().position);
+        if (done < target) {
+            Cause cause = Cause::HostSync;
+            if (target != last_writer_position && target != last_sync_position) {
+                const u32 method = target_method;
+                cause = method == DeferredWrite               ? Cause::Deferred
+                        : method == OtherEngineWrite          ? Cause::OtherEngine
+                        : method >= 0x8e4 && method < 0x8f4   ? Cause::ConstBufferUpload
+                        : method == 0x6d                      ? Cause::InlineUpload
+                        : method == 0x6c3                     ? Cause::Report
+                        : method == 0x6c                      ? Cause::DmaLaunch
+                        : method == 0xb2                      ? Cause::SyncInfo
+                        : method == 0x44                      ? Cause::WaitForIdle
+                        : method >= 0xe00                     ? Cause::Macro3D
+                                                              : Cause::Other3D;
+            } else if (target == last_writer_position) {
+                cause = Cause::ComputeCopy;
+            }
+            Nx2Profile::AddDmaWaitCause(cause);
+        } else if (done < std::min(all_writes, write_position)) {
+            Nx2Profile::AddDmaWaitCause(Cause::AvoidedByRange);
+        }
+    }
+    return WaitFor(target, site);
 }
 
 bool GpuSplit::WaitFor(u64 target, DrainSite site) {
@@ -241,6 +583,7 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
         return false;
     }
     Nx2Profile::Scope scope{Nx2Profile::Zone::WriterWait};
+    Common::Nx2Timeline::Span timeline_span{drain_site_names[static_cast<size_t>(site)]};
     wait_target.store(target, std::memory_order_seq_cst);
     Publish();
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
@@ -279,11 +622,12 @@ void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
     u64* const entry = Reserve(2);
     entry[0] = static_cast<u64>(Kind::Engine);
     entry[1] = reinterpret_cast<u64>(engine);
-    Commit(2);
+    Commit(2, Effect::None);
 }
 
 void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
-                           u32 amount, u32 methods_pending, const GPUVAddr* segment) {
+                           u32 amount, u32 methods_pending, const GPUVAddr* segment,
+                           Effect effect) {
     SelectEngine(engine);
     // Long runs (constant buffer and inline uploads) go in pieces, as when a method's data
     // continues in the next GPFIFO entry.
@@ -300,10 +644,13 @@ void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, 
         }
         entry[size - 1] = 0;
         std::memcpy(entry + head, words, size_t{piece} * sizeof(u32));
-        Commit(size);
+        Commit(size, effect);
         words += piece;
         amount -= piece;
         methods_pending -= piece;
+    }
+    if (engine->memory_write_mask[method]) {
+        NoteMethodWrite(engine, method);
     }
 }
 
@@ -379,6 +726,9 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
             Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
             engine->ConsumeSink(*system);
             engine->CallMethod(*system, method, argument, true);
+        } else if ((head & Sink) != 0) {
+            engine->method_sink.emplace_back(
+                method | Tegra::Engines::EngineInterface::SplitPlainTag, argument);
         } else if (!engine->execution_mask[method]) {
             engine->method_sink.emplace_back(method, argument);
         } else {
@@ -410,6 +760,16 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
         return 2 + payload;
     }
+    case Kind::Pairs: {
+        // EDEN_NX2_RING_PAIRS: one profiler scope and one call for the block; the sink first,
+        // as for any other write, to keep the order.
+        const u32 count = static_cast<u32>(head >> 32);
+        auto* const engine = back_engine;
+        Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+        engine->ConsumeSink(*system);
+        engine->ApplyPairs(*system, entry + 1, count);
+        return 1 + size_t{count};
+    }
     }
     return 1;
 }
@@ -420,6 +780,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     on_back_thread = true;
     back_running.store(true, std::memory_order_release);
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
+    Common::PinCurrentThread(Common::PinnedRole::GpuBack);
     Common::SetCurrentThreadToPerformanceCores();
     if (Settings::values.pin_gpu_threads.GetValue()) {
         Common::PinCurrentThread(Common::PinnedRole::GpuBack);

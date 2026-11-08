@@ -141,6 +141,15 @@ public:
         return fragment_has_color0_output;
     }
 
+    /// Texture handles of the last configured draw whose handle program gave 0.
+    u32 ZeroTextureHandles() const noexcept {
+        return zero_texture_handles;
+    }
+
+    bool FragmentCanDiscard() const noexcept {
+        return stage_infos[NUM_STAGES - 1].uses_demote_to_helper_invocation;
+    }
+
     /// Color components of a render target the fragment shader writes, as VkColorComponentFlags
     VkColorComponentFlags ColorOutputMask(size_t render_target) const noexcept {
         return (color_output_mask >> (render_target * 4)) & 0xF;
@@ -317,6 +326,7 @@ private:
     std::vector<SampledImage> sampled_images;
     u32 num_textures{};
     bool fragment_has_color0_output{};
+    u32 zero_texture_handles{};
     u32 color_output_mask{};
     bool writes_storage{};
 

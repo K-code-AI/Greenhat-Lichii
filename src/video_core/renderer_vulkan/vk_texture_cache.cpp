@@ -72,8 +72,16 @@ using VideoCore::Surface::SurfaceType;
 namespace {
 constexpr bool ENABLE_MSAA_TILER_RESOLVE = true;
 constexpr bool ENABLE_MSAA_RESOLVE_CONSUME = true;
-constexpr bool ENABLE_MSAA_COLOR_DISCARD = true;
-constexpr bool ENABLE_MSAA_DEPTH_STENCIL_DISCARD = true;
+// EDEN_NX2_MSAA_DISCARD=0: MSAA render passes keep their samples (STORE_OP_STORE) even when they
+// begin with a clear. A discarding pass that something ends early (a copy needs the render pass
+// closed) loses the samples drawn so far, and its resumed half loads garbage.
+bool MsaaDiscardEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_MSAA_DISCARD");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
 
 [[nodiscard]] constexpr bool NeedsExplicitBorderColorFormat(VkFormat format) {
     switch (format) {
@@ -4586,6 +4594,10 @@ Sampler::VariantKey Sampler::MakeKey(const ImageView& image_view, bool is_depth)
     key.drop_reduction = has_minmax_reduction && !image_view.SupportsMinmaxFilter();
     key.drop_custom_border = has_custom_border_colors && image_view.RequiresBorderColorFormat();
     key.srgb_border = has_srgb_border_color && IsPixelFormatSRGB(image_view.format);
+    // A compare-enabled TSC read by a plain (non-Dref) sample: Maxwell ignores the comparison,
+    // Vulkan leaves it undefined and AMD returns the 0/1 compare result (Ocarina forest fog
+    // composite read alpha 0 -> black screen). Use a variant without comparison.
+    key.drop_compare = has_depth_comparison && !is_depth;
     if (needs_swizzle_mapping && !key.drop_custom_border && !image_view.HasIdentitySwizzle()) {
         const VkComponentMapping& mapping = image_view.Swizzle();
         key.swizzle = {mapping.r, mapping.g, mapping.b, mapping.a};
@@ -4649,6 +4661,9 @@ VkSampler Sampler::Emplace(VariantKey key) {
     }
 
     VkSamplerCreateInfo create_info = base_ci;
+    if (key.drop_compare) {
+        create_info.compareEnable = VK_FALSE;
+    }
     create_info.pNext = chain;
     if (key.force_nearest) {
         create_info.magFilter = VK_FILTER_NEAREST;
@@ -4800,10 +4815,9 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
         SupportsDepthStencilResolve(runtime.device, renderpass_key.depth_format);
     renderpass_key.resolve_depth_stencil = do_resolve_depth_stencil;
 
-    discard_msaa_color =
-        ENABLE_MSAA_RESOLVE_CONSUME && ENABLE_MSAA_COLOR_DISCARD && do_resolve_color;
-    discard_msaa_depth_stencil = ENABLE_MSAA_RESOLVE_CONSUME &&
-                                 ENABLE_MSAA_DEPTH_STENCIL_DISCARD && do_resolve_depth_stencil;
+    discard_msaa_color = ENABLE_MSAA_RESOLVE_CONSUME && MsaaDiscardEnabled() && do_resolve_color;
+    discard_msaa_depth_stencil =
+        ENABLE_MSAA_RESOLVE_CONSUME && MsaaDiscardEnabled() && do_resolve_depth_stencil;
 
     renderpass = runtime.render_pass_cache.Get(renderpass_key);
     render_pass_key = renderpass_key;

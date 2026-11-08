@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <span>
 #include <array>
 #include <cstddef>
 #include <cstring>

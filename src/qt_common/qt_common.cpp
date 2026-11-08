@@ -26,6 +26,7 @@
 
 #include <QMessageBox>
 
+#include <string_view>
 #include <thread>
 #include <JlCompress.h>
 #include <QPainter>

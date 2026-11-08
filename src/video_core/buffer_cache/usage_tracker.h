@@ -161,6 +161,7 @@ private:
     /// Ranges tracked last, (offset, size).
     std::array<std::pair<u64, u64>, 4> recent{{{~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}}};
     size_t recent_cursor{};
+    bool tracked{};
     /// Pages known to be all ones (FillPages).
     size_t full_begin{};
     size_t full_end{};

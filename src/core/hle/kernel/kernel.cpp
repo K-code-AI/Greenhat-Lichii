@@ -121,13 +121,20 @@ struct KernelCore::Impl {
     }
 
     void TerminateAllProcesses() {
-        std::scoped_lock lk{process_list_lock};
-        for (auto& process : process_list) {
+        // Terminate outside the lock: waiting for a process's threads with the lock held deadlocked
+        // against AM's service thread, which blocks its emulated core on this lock in RemoveProcess
+        // while destroying its applets at shutdown (hang on closing, issue 222). RemoveProcess then
+        // finds nothing to erase, and each process keeps the reference closed below.
+        std::vector<KProcess*> processes;
+        {
+            std::scoped_lock lk{process_list_lock};
+            processes.assign(process_list.begin(), process_list.end());
+            process_list.clear();
+        }
+        for (KProcess* const process : processes) {
             process->Terminate(system.Kernel());
             process->Close(system.Kernel());
-            process = nullptr;
         }
-        process_list.clear();
     }
 
     void Shutdown(KernelCore& kernel) {

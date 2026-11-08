@@ -125,6 +125,9 @@ public:
     /// Switch 2: the front flushed this command list page with the split drained.
     virtual void NoteGpuWrittenCommandListSynced([[maybe_unused]] DAddr page) {}
 
+    /// Switch 2, on the split's back with the front waiting: flushes the command list pages
+    /// `pages` (4 KiB, device addresses) to guest memory, with every page draws wrote since it was
+    /// last flushed, in one GPU round trip.
     virtual void FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) {
         for (const DAddr page : pages) {
             FlushRegion(page, 0x1000, VideoCommon::CacheType::BufferCache);
@@ -141,6 +144,14 @@ public:
     [[nodiscard]] virtual bool HasPendingQueries([[maybe_unused]] DAddr addr,
                                                  [[maybe_unused]] u64 size) {
         return false;
+    }
+
+    /// Whether the query cache still lists a report in the range (pending host results, or
+    /// written and not unregistered yet). Takes only the query cache mutex: callable from the
+    /// split front. Conservative (true) where not implemented.
+    [[nodiscard]] virtual bool HasCachedReports([[maybe_unused]] DAddr addr,
+                                                [[maybe_unused]] u64 size) {
+        return true;
     }
 
     /// Notify rasterizer that any caches of the specified region should be invalidated

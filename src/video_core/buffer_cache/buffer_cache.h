@@ -282,14 +282,30 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
     area->start_address = device_addr_start_aligned;
     area->end_address = device_addr_end_aligned;
     if (memory_tracker.IsRegionPreflushable(device_addr, size)) {
-        area->preemtive = true;
+        // A preflushed region's data reaches guest memory when its fence pops (PopAsyncBuffers
+        // clears gpu_modified_ranges then). A read before that saw stale words: Ocarina of Time's
+        // whole screen flashed white near the sword boulder with EDEN_NX2_PREFLUSH=1 (232 flash
+        // watch reports a session, 3 without preflush). Such a read flushes on demand instead.
+        area->preemtive = !IsRegionGpuModified(device_addr_start_aligned,
+                                               device_addr_end_aligned - device_addr_start_aligned);
         return area;
-    };
+    }
     area->preemtive = !IsRegionGpuModified(device_addr_start_aligned,
                                            device_addr_end_aligned - device_addr_start_aligned);
     // A preflushable mark persists and downloads later GPU writes at every fence. Native titles
-    // instead keep read traps and flush on demand.
-    const bool preflush = !Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
+    // instead keep read traps and flush on demand; EDEN_NX2_PREFLUSH=1 restores preflushing.
+    // Not Ocarina of Time either: preflushing its CPU's ~170 reads a second of GPU-written pages
+    // was worth ~3 fps, but a third of loads into Castle Town then rendered overexposed and
+    // tinted (stale or wrong exposure data), against none with the traps.
+    static const std::optional<bool> forced_preflush = []() -> std::optional<bool> {
+        const char* value = std::getenv("EDEN_NX2_PREFLUSH");
+        if (value != nullptr) {
+            return value[0] != '0';
+        }
+        return std::nullopt;
+    }();
+    const bool preflush =
+        forced_preflush.value_or(!Tegra::g_nx2_ampere.load(std::memory_order_relaxed));
     if (!area->preemtive) {
         if (Nx2DownloadTrace::g_enabled) [[unlikely]] {
             Nx2DownloadTrace::Marked(device_addr_start_aligned,
@@ -411,6 +427,97 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
             } else {
                 runtime.Finish();
             }
+            for (const Download& download : staged) {
+                WriteDownloadedMemory(
+                    cpu_written,
+                    slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset,
+                    staging.mapped_span.data() + (download.copy.dst_offset - staging.offset),
+                    download.copy.size);
+            }
+        }
+        if constexpr (has_mapped) {
+            for (const Download& download : mapped) {
+                Buffer& buffer = slot_buffers[download.buffer_id];
+                WriteDownloadedMemory(cpu_written, buffer.CpuAddr() + download.copy.src_offset,
+                                      buffer.Mapped().data() + download.copy.src_offset,
+                                      download.copy.size);
+            }
+        }
+    }
+}
+
+template <class P>
+void BufferCache<P>::DownloadMemoryRanges(std::span<const std::pair<DAddr, u64>> ranges) {
+    constexpr bool has_mapped = requires(Buffer& buffer) {
+        buffer.Mapped();
+        buffer.LastUsageTick();
+    };
+    if constexpr (!USE_MEMORY_MAPS) {
+        for (const auto& [device_addr, size] : ranges) {
+            DownloadMemory(device_addr, size);
+        }
+    } else {
+        struct Download {
+            BufferId buffer_id;
+            BufferCopy copy;
+        };
+        std::vector<Download> staged;
+        std::vector<Download> mapped;
+        u64 total_size_bytes = 0;
+        u64 mapped_tick = 0;
+        for (const auto& [device_addr, size] : ranges) {
+            ForEachBufferInRange(device_addr, size, [&](BufferId buffer_id, Buffer& buffer) {
+                const DAddr buffer_addr = buffer.CpuAddr();
+                const DAddr begin = (std::max)(device_addr, buffer_addr);
+                const DAddr end = (std::min)(device_addr + size, buffer_addr + buffer.SizeBytes());
+                if (begin >= end) {
+                    return;
+                }
+                bool is_mapped = false;
+                if constexpr (has_mapped) {
+                    is_mapped = !buffer.Mapped().empty();
+                    if (is_mapped) {
+                        mapped_tick = (std::max)(mapped_tick, buffer.LastUsageTick());
+                    }
+                }
+                memory_tracker.ForEachDownloadRangeAndClear(
+                    begin, end - begin, [&](u64 device_addr_out, u64 range_size) {
+                        gpu_modified_ranges.ForEachInRange(
+                            device_addr_out, range_size, [&](DAddr start, DAddr range_end) {
+                                const BufferCopy copy{
+                                    .src_offset = start - buffer_addr,
+                                    .dst_offset = total_size_bytes,
+                                    .size = range_end - start,
+                                };
+                                if (is_mapped) {
+                                    mapped.push_back({buffer_id, copy});
+                                    return;
+                                }
+                                staged.push_back({buffer_id, copy});
+                                total_size_bytes += Common::AlignUp(range_end - start, 64);
+                            });
+                        ClearDownload(device_addr_out, range_size);
+                        gpu_modified_ranges.Subtract(device_addr_out, range_size);
+                    });
+            });
+        }
+        if (staged.empty() && mapped.empty()) {
+            return;
+        }
+        const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
+        if (staged.empty()) {
+            if constexpr (has_mapped) {
+                runtime.Wait(mapped_tick);
+            }
+        } else {
+            auto staging = runtime.DownloadStagingBuffer(total_size_bytes);
+            for (Download& download : staged) {
+                download.copy.dst_offset += staging.offset;
+                Buffer& buffer = slot_buffers[download.buffer_id];
+                buffer.MarkUsage(download.copy.src_offset, download.copy.size);
+                runtime.CopyBuffer(staging.buffer, buffer, std::span{&download.copy, 1}, true);
+            }
+            runtime.Finish();
             for (const Download& download : staged) {
                 WriteDownloadedMemory(
                     cpu_written,
@@ -1406,6 +1513,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     // Native programs keep tables next to their code in a 64 KiB bank read with indirect offsets
     // (Splatoon Raiders: the dialogue box corners in c1). Writes to that memory can go unnoticed by
     // the memory tracker, leaving stale host contents, so upload such a bank again once per frame.
+    // Copied directly: marking it CPU-modified unprotected and reprotected its pages each frame.
     if (has_host_buffer && (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
         size != 0 && gpu_memory != nullptr && gpu_memory->UsesNativeTiling() &&
         (Nx2Perf::Verify() || !native_indirect_uniforms_this_frame.contains(device_addr)) &&
@@ -1600,7 +1708,7 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
         buffer.MarkUsage(offset, size);
 
         if (is_written) {
-            MarkWrittenBuffer(binding.buffer_id, binding.device_addr, size);
+            MarkWrittenBuffer(binding.buffer_id, binding.device_addr, WrittenStorageMarkSize(size));
         }
 
         if constexpr (NEEDS_BIND_STORAGE_INDEX) {
@@ -1747,7 +1855,8 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
         buffer.MarkUsage(offset, size);
 
         if (is_written) {
-            MarkWrittenBuffer(binding.buffer_id, binding.device_addr, size, true);
+            MarkWrittenBuffer(binding.buffer_id, binding.device_addr, WrittenStorageMarkSize(size),
+                              true);
         }
 
         if constexpr (NEEDS_BIND_STORAGE_INDEX) {
@@ -2117,7 +2226,7 @@ void BufferCache<P>::Nx2NoteListWrite(BufferId buffer_id, DAddr device_addr, u64
 }
 
 template <class P>
-bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
+bool BufferCache<P>::Nx2CopyListPages(u64 tick, u64 writer) {
     if constexpr (IS_OPENGL) {
         return false;
     } else {
@@ -2157,6 +2266,7 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
             entry.copy = staging;
             entry.copy_writes = entry.writes;
             entry.copy_tick = tick;
+            entry.copy_writer = writer;
             entry.copy_begin = static_cast<u32>(begin - page);
             entry.copy_end = static_cast<u32>(end - page);
         }
@@ -2190,6 +2300,7 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool 
         };
         u64 tick{};
         u64 writes{};
+        u64 writer{};
         {
             std::scoped_lock lock{nx2_list_mutex};
             const auto it = nx2_list_pages.find(page);
@@ -2223,9 +2334,10 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool 
             }
             tick = entry.copy_tick;
             writes = entry.copy_writes;
+            writer = entry.copy_writer;
         }
         // Submitted with the work that wrote the page (Nx2CopyListPages's caller flushes).
-        runtime.WaitSubmittedTick(tick);
+        runtime.WaitSubmittedTick(tick, writer);
         std::scoped_lock lock{nx2_list_mutex};
         const auto it = nx2_list_pages.find(page);
         if (it == nx2_list_pages.end() || !current(it->second) || it->second.copy_tick != tick ||
@@ -2263,13 +2375,13 @@ void BufferCache<P>::Nx2FlushListPages(std::span<const DAddr> pages) {
             }
         }
     }
-    DownloadRangesMemory(ranges);
+    DownloadMemoryRanges(ranges);
     if constexpr (!IS_OPENGL) {
         std::scoped_lock lock{nx2_list_mutex};
         for (const auto& [page, writes] : drawn) {
-            const auto it = nx2_list_pages.find(page);
-            if (it != nx2_list_pages.end() && it->second.writes == writes) {
-                it->second.synced_writes = writes;
+            Nx2ListPage& entry = nx2_list_pages[page];
+            if (entry.writes == writes) {
+                entry.synced_writes = writes;
             }
         }
     }
@@ -2785,6 +2897,42 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
         return;
     }
     const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
+    // EDEN_NX2_DOWNLOAD_STATS=1: how buffer downloads (reactive flushes among them) are made and
+    // what they wait for, logged every 5 s.
+    static const bool download_stats = std::getenv("EDEN_NX2_DOWNLOAD_STATS") != nullptr;
+    struct DownloadStats {
+        u64 mapped{}, staged{}, mapped_ns{}, staged_ns{}, bytes{}, writer_done{};
+        std::chrono::steady_clock::time_point last{std::chrono::steady_clock::now()};
+    };
+    static DownloadStats stats;
+    const auto stats_begin = download_stats ? std::chrono::steady_clock::now()
+                                            : std::chrono::steady_clock::time_point{};
+    const auto note_download = [&](bool mapped_path) {
+        if (!download_stats) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const u64 ns = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now - stats_begin).count());
+        (mapped_path ? stats.mapped : stats.staged) += 1;
+        (mapped_path ? stats.mapped_ns : stats.staged_ns) += ns;
+        stats.bytes += total_size_bytes;
+        if (now - stats.last >= std::chrono::seconds{5}) {
+            const double window = std::chrono::duration<double>(now - stats.last).count();
+            LOG_INFO(HW_GPU,
+                     "Download stats: {:.0f} mapped/s ({:.1f} ms/s), {:.0f} staged/s ({:.1f} ms/s), "
+                     "{:.0f} KiB/s, writer already done {:.0f}/s",
+                     stats.mapped / window, stats.mapped_ns / 1e6 / window, stats.staged / window,
+                     stats.staged_ns / 1e6 / window, stats.bytes / 1024.0 / window,
+                     stats.writer_done / window);
+            stats = DownloadStats{};
+        }
+    };
+    if constexpr (!IS_OPENGL) {
+        if (download_stats && runtime.IsFree(buffer.getWriteTick())) {
+            ++stats.writer_done;
+        }
+    }
 
     if constexpr (requires { buffer.Mapped(); }) {
         if (const auto mapped = buffer.Mapped(); !mapped.empty()) {
@@ -2793,6 +2941,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
                 WriteDownloadedMemory(cpu_written, buffer.CpuAddr() + copy.src_offset,
                                       mapped.data() + copy.src_offset, copy.size);
             }
+            note_download(true);
             return;
         }
     }
@@ -2814,6 +2963,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
             const u8* copy_mapped_memory = mapped_memory + dst_offset;
             WriteDownloadedMemory(cpu_written, copy_device_addr, copy_mapped_memory, copy.size);
         }
+        note_download(false);
     } else {
         const std::span<u8> immediate_buffer = ImmediateBuffer(largest_copy);
         for (const BufferCopy& copy : copies) {

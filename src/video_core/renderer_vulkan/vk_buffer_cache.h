@@ -128,7 +128,8 @@ public:
     void Wait(u64 tick);
 
     /// Waits for a submitted tick without flushing: safe on threads other than the GPU thread.
-    void WaitSubmittedTick(u64 tick);
+    void WaitSubmittedTick(u64 tick, u64 writer = 0);
+    void WaitSubmittedTickImpl(u64 tick);
 
     void Finish();
 
@@ -284,6 +285,10 @@ public:
 
     u32 GetMaxDynamicStorageBuffers() const {
         return max_dynamic_storage_buffers;
+    }
+
+    u32 GetMaxStorageBufferRange() const {
+        return static_cast<u32>(device.GetMaxStorageBufferRange());
     }
 
 private:
