@@ -268,9 +268,6 @@ public:
 
     void DownloadMemory(DAddr device_addr, u64 size);
 
-    /// DownloadMemory for each range, waiting for the GPU once.
-    void DownloadMemoryRanges(std::span<const std::pair<DAddr, u64>> ranges);
-
     std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr device_addr, u64 size);
 
     /// Without downloads at every fence, a guest CPU read is the only way GPU-written buffer

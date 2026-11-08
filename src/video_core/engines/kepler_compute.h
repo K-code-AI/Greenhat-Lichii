@@ -23,6 +23,7 @@
 #include "video_core/game_dlss_status.h"
 #include "video_core/macro.h"
 #include "video_core/native_qmd.h"
+#include "video_core/split_write_tracker.h"
 #include "video_core/textures/texture.h"
 
 namespace Core {

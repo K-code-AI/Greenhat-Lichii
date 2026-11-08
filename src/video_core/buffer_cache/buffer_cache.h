@@ -447,97 +447,6 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
 }
 
 template <class P>
-void BufferCache<P>::DownloadMemoryRanges(std::span<const std::pair<DAddr, u64>> ranges) {
-    constexpr bool has_mapped = requires(Buffer& buffer) {
-        buffer.Mapped();
-        buffer.LastUsageTick();
-    };
-    if constexpr (!USE_MEMORY_MAPS) {
-        for (const auto& [device_addr, size] : ranges) {
-            DownloadMemory(device_addr, size);
-        }
-    } else {
-        struct Download {
-            BufferId buffer_id;
-            BufferCopy copy;
-        };
-        std::vector<Download> staged;
-        std::vector<Download> mapped;
-        u64 total_size_bytes = 0;
-        u64 mapped_tick = 0;
-        for (const auto& [device_addr, size] : ranges) {
-            ForEachBufferInRange(device_addr, size, [&](BufferId buffer_id, Buffer& buffer) {
-                const DAddr buffer_addr = buffer.CpuAddr();
-                const DAddr begin = (std::max)(device_addr, buffer_addr);
-                const DAddr end = (std::min)(device_addr + size, buffer_addr + buffer.SizeBytes());
-                if (begin >= end) {
-                    return;
-                }
-                bool is_mapped = false;
-                if constexpr (has_mapped) {
-                    is_mapped = !buffer.Mapped().empty();
-                    if (is_mapped) {
-                        mapped_tick = (std::max)(mapped_tick, buffer.LastUsageTick());
-                    }
-                }
-                memory_tracker.ForEachDownloadRangeAndClear(
-                    begin, end - begin, [&](u64 device_addr_out, u64 range_size) {
-                        gpu_modified_ranges.ForEachInRange(
-                            device_addr_out, range_size, [&](DAddr start, DAddr range_end) {
-                                const BufferCopy copy{
-                                    .src_offset = start - buffer_addr,
-                                    .dst_offset = total_size_bytes,
-                                    .size = range_end - start,
-                                };
-                                if (is_mapped) {
-                                    mapped.push_back({buffer_id, copy});
-                                    return;
-                                }
-                                staged.push_back({buffer_id, copy});
-                                total_size_bytes += Common::AlignUp(range_end - start, 64);
-                            });
-                        ClearDownload(device_addr_out, range_size);
-                        gpu_modified_ranges.Subtract(device_addr_out, range_size);
-                    });
-            });
-        }
-        if (staged.empty() && mapped.empty()) {
-            return;
-        }
-        const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
-        if (staged.empty()) {
-            if constexpr (has_mapped) {
-                runtime.Wait(mapped_tick);
-            }
-        } else {
-            auto staging = runtime.DownloadStagingBuffer(total_size_bytes);
-            for (Download& download : staged) {
-                download.copy.dst_offset += staging.offset;
-                Buffer& buffer = slot_buffers[download.buffer_id];
-                buffer.MarkUsage(download.copy.src_offset, download.copy.size);
-                runtime.CopyBuffer(staging.buffer, buffer, std::span{&download.copy, 1}, true);
-            }
-            runtime.Finish();
-            for (const Download& download : staged) {
-                WriteDownloadedMemory(
-                    cpu_written,
-                    slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset,
-                    staging.mapped_span.data() + (download.copy.dst_offset - staging.offset),
-                    download.copy.size);
-            }
-        }
-        if constexpr (has_mapped) {
-            for (const Download& download : mapped) {
-                Buffer& buffer = slot_buffers[download.buffer_id];
-                WriteDownloadedMemory(cpu_written, buffer.CpuAddr() + download.copy.src_offset,
-                                      buffer.Mapped().data() + download.copy.src_offset,
-                                      download.copy.size);
-            }
-        }
-    }
-}
-
-template <class P>
 void BufferCache<P>::ClearDownload(DAddr device_addr, u64 size) {
     for (auto& ranges : pending_download_ranges) {
         ranges.Subtract(device_addr, size);
@@ -2375,13 +2284,13 @@ void BufferCache<P>::Nx2FlushListPages(std::span<const DAddr> pages) {
             }
         }
     }
-    DownloadMemoryRanges(ranges);
+    DownloadRangesMemory(ranges);
     if constexpr (!IS_OPENGL) {
         std::scoped_lock lock{nx2_list_mutex};
         for (const auto& [page, writes] : drawn) {
-            Nx2ListPage& entry = nx2_list_pages[page];
-            if (entry.writes == writes) {
-                entry.synced_writes = writes;
+            const auto it = nx2_list_pages.find(page);
+            if (it != nx2_list_pages.end() && it->second.writes == writes) {
+                it->second.synced_writes = writes;
             }
         }
     }

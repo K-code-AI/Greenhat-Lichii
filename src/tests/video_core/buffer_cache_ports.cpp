@@ -73,7 +73,7 @@ struct Runtime {
     bool IsFree(u64) const {
         return true;
     }
-    void WaitSubmittedTick(u64) {}
+    void WaitSubmittedTick(u64, u64 = 0) {}
     bool CanReorderUpload(const Buffer&, std::span<VideoCommon::BufferCopy>) const {
         return false;
     }
